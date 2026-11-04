@@ -1,0 +1,5 @@
+# 让 input 组成员可以创建注入用的虚拟设备。
+# 改写自 xremap 官方文档 doc/running_without_sudo.md（MIT，见 THIRD-PARTY-NOTICES.md）。
+# 注意：在 Ubuntu/GNOME 上光靠这条规则不够 —— logind 的 uaccess 会把 group:: 降成 ---，
+# 需要配合 sidekeys.service 里的 ExecStartPre setfacl 才能拿到权限。
+KERNEL=="uinput", GROUP="input", TAG+="uaccess", MODE="0660", OPTIONS+="static_node=uinput"

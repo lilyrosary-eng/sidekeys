@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Side Buttons
+Name[zh_CN]=侧键映射
+GenericName=Mouse side-button mapping
+GenericName[zh_CN]=鼠标侧键映射
+Comment=Map the two side buttons of your mouse with xremap
+Comment[zh_CN]=用 xremap 映射鼠标的两个侧键
+Exec=@BINDIR@/sidekeys
+Icon=input-mouse
+Terminal=false
+Categories=Settings;GTK;HardwareSettings;
+Keywords=mouse;side button;xremap;remap;
+Keywords[zh_CN]=鼠标;侧键;映射;xremap;
+StartupNotify=true

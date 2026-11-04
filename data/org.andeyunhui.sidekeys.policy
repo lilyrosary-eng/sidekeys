@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "https://specifications.freedesktop.org/policykit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>Andeyunhui</vendor>
+  <vendor_url>https://github.com/andeyunhui</vendor_url>
+
+  <action id="org.andeyunhui.sidekeys.apply">
+    <description>Apply side-button mapping (write /etc/xremap and restart xremap)</description>
+    <description xml:lang="zh_CN">应用侧键映射（写入 /etc/xremap 并重启 xremap）</description>
+    <message>Authentication is required to change mouse side-button mapping</message>
+    <message xml:lang="zh_CN">需要验证身份才能修改鼠标侧键映射</message>
+    <icon_name>input-mouse</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/sidekeys-apply</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

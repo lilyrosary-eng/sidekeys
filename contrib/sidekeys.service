@@ -1,0 +1,31 @@
+[Unit]
+Description=sidekeys (xremap-powered mouse side-button remapping)
+Documentation=https://github.com/lilyrosary-eng/sidekeys
+After=default.target
+
+[Service]
+# 实际入口是 wrapper：systemd 会把展开后的变量按空白拆成多个参数，而设备名里几乎总带空格，
+# 所以必须由 shell 负责引号。见 contrib/sidekeys-run。
+ExecStart=/usr/local/bin/sidekeys-run
+
+# “+”前缀表示这一行始终以 root 运行（User= 只作用于主进程）。
+# Ubuntu 上 logind 的 uaccess 会把 /dev/uinput 的 ACL group:: 降成 ---，
+# 即使节点属组是 input 也拿不到权限，因此每次启动补一条组 ACL。
+ExecStartPre=+/usr/bin/setfacl -m g:input:rw /dev/uinput
+
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+User=xremap
+Group=xremap
+SupplementaryGroups=input
+RuntimeDirectory=xremap
+RuntimeDirectoryMode=0755
+Environment=RUST_LOG=warn
+MemoryHigh=8M
+MemoryMax=16M
+IPAddressDeny=any
+
+[Install]
+WantedBy=default.target

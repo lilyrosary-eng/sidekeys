@@ -1,0 +1,23 @@
+#!/bin/bash
+# sidekeys-run —— systemd 的实际入口。
+#
+# 为什么需要这个 wrapper：systemd 在 ExecStart 里是「先剥引号、再展开变量」，
+# 所以 "$SIDEKEYS_DEVICE" 展开后仍会按空白拆成多个参数。设备名里带空格
+# （几乎所有鼠标都叫 "XXX Wireless Device Mouse" 这种）就会被拆坏。
+# 交给 shell 来引用才是对的。
+
+set -euo pipefail
+
+ENV_FILE=/etc/xremap/sidekeys.env
+CONFIG=/etc/xremap/config.yml
+XREMAP=/usr/bin/xremap
+
+[ -r "$ENV_FILE" ] || { echo "缺少 $ENV_FILE：先用 GUI 应用一次配置，或手写 SIDEKEYS_DEVICE=<设备名>" >&2; exit 1; }
+[ -s "$CONFIG" ] || { echo "缺少 $CONFIG（空文件也会让侧键失效）" >&2; exit 1; }
+[ -x "$XREMAP" ] || { echo "没找到 $XREMAP" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+[ -n "${SIDEKEYS_DEVICE:-}" ] || { echo "$ENV_FILE 里 SIDEKEYS_DEVICE 是空的" >&2; exit 1; }
+
+exec "$XREMAP" --desktop=none --mouse --device "$SIDEKEYS_DEVICE" --watch=device "$CONFIG"

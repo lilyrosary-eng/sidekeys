@@ -1,0 +1,110 @@
+#!/bin/bash
+# sidekeys-apply —— 侧键映射工具的 root 侧。只被 pkexec 调用，刻意不接受任意命令。
+#
+#   sidekeys-apply apply <暂存 yml> <设备名>   校验 → 备份 → 写入 → 重启服务（失败自动回滚）
+#   sidekeys-apply restore                     恢复上一次备份
+#   sidekeys-apply start | stop                启停服务
+#
+# 设备名写进 /etc/xremap/sidekeys.env，systemd unit 用 --device "$SIDEKEYS_DEVICE" 读取，
+# 这样换鼠标只要改配置，不用碰 unit；也保证永远只接管一个设备。
+
+set -euo pipefail
+
+CONF=/etc/xremap/config.yml
+ENVF=/etc/xremap/sidekeys.env
+BACKUP=/etc/xremap/config.yml.bak
+XREMAP=/usr/bin/xremap
+UNIT=sidekeys
+
+die() { echo "$*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "请以 root 运行（正常途径是 pkexec）"
+[ -x "$XREMAP" ] || die "没找到 $XREMAP：先安装 xremap（见 README）"
+
+wait_active() {
+    for _ in 1 2 3 4 5 6; do
+        [ "$(systemctl is-active "$UNIT")" = active ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+logs() { journalctl -u "$UNIT" -n 8 --no-pager 2>&1 | tail -8; }
+
+case "${1:-}" in
+    apply)
+        stage="${2:?用法: sidekeys-apply apply <yml 文件> <设备名>}"
+        device="${3:?缺少设备名：本工具刻意只接管单个设备}"
+
+        # 设备名会被写进 systemd 环境文件，先做字符白名单：禁止换行、引号、反斜杠等
+        clean=$(printf '%s' "$device" | tr -cd '[:alnum:] .:_/-')
+        [ "$clean" = "$device" ] || die "设备名里有不被允许的字符：$device"
+        [ -n "$device" ] || die "设备名不能为空：本工具刻意只接管单个设备"
+        [ -r "$stage" ] || die "读不到 $stage"
+        [ -s "$stage" ] || die "暂存文件是空的，拒绝写入（否则侧键映射会被清空）"
+
+        # 语法校验：不通过就根本不写盘
+        if ! out=$("$XREMAP" --validate-config "$stage" 2>&1); then
+            die "配置校验未通过，已放弃写入：
+$out"
+        fi
+
+        # 语义校验：xremap 认为“空配置”也合法，会静默取消所有映射。
+        # 本工具只管侧键，所以必须至少含一条 BTN_SIDE/BTN_EXTRA。
+        if ! python3 - "$stage" <<'PY'
+import sys
+import yaml
+
+try:
+    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+except Exception:
+    sys.exit(1)
+for block in doc.get("keymap") or []:
+    remap = block.get("remap") if isinstance(block, dict) else None
+    if remap and any(code in remap for code in ("BTN_SIDE", "BTN_EXTRA")):
+        sys.exit(0)
+sys.exit(1)
+PY
+        then
+            die "配置里没有任何侧键映射，拒绝写入（防止误清空现有映射）"
+        fi
+
+        mkdir -p "$(dirname "$CONF")"
+        [ -f "$CONF" ] && cp -a "$CONF" "$BACKUP"
+        install -m 0644 -o xremap -g xremap "$stage" "$CONF"
+        printf 'SIDEKEYS_DEVICE="%s"\n' "$device" > "$ENVF"
+        chmod 0644 "$ENVF"
+
+        systemctl daemon-reload
+        if ! systemctl restart "$UNIT" || ! wait_active; then
+            state=$(systemctl is-active "$UNIT" || true)
+            if [ -f "$BACKUP" ]; then
+                cp -a "$BACKUP" "$CONF"
+                systemctl restart "$UNIT" || true
+            fi
+            die "$UNIT 启动失败（$state），已回滚到上一版配置。最近日志：
+$(logs)"
+        fi
+
+        echo "已生效（$UNIT $(systemctl is-active "$UNIT")，接管设备：$device）"
+        ;;
+    restore)
+        [ -f "$BACKUP" ] || die "没有可恢复的备份（$BACKUP 不存在）"
+        cp -a "$BACKUP" "$CONF"
+        systemctl restart "$UNIT"
+        wait_active || die "恢复后服务没能启动：$(logs)"
+        echo "已恢复上一版配置"
+        ;;
+    start)
+        systemctl start "$UNIT"
+        wait_active || die "启动失败：$(logs)"
+        echo "服务已启动"
+        ;;
+    stop)
+        systemctl stop "$UNIT"
+        echo "服务已停止（侧键恢复鼠标默认行为）"
+        ;;
+    *)
+        die "未知子命令：${1:-}（可用：apply / restore / start / stop）"
+        ;;
+esac
