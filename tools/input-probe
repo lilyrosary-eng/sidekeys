@@ -69,7 +69,8 @@ def main():
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     positional = [a for a in sys.argv[1:] if not a.startswith("--")]
     keys_only = "--keys" in flags
-    seconds = float(positional[0]) if positional else 30.0
+    seconds = float(positional[0]) if positional else 45.0
+    preroll = 5.0
     devices = []
     for p in evdev.list_devices():
         try:
@@ -88,7 +89,12 @@ def main():
     for p in hidraws:
         vidpid, iface, name = hidraw_info(p)
         print(f"    {p}  {vidpid}  iface {iface}  {name}")
-    print("\n请依次按目标键（每个 2 次，间隔约 1 秒），Ctrl-C 可提前结束。\n", flush=True)
+    print(f"\n{preroll:.0f} 秒后开始，请把手放到鼠标上…", flush=True)
+    for i in range(int(preroll), 0, -1):
+        print(f"    {i}…", flush=True)
+        time.sleep(1)
+    stop_at = time.monotonic() + seconds
+    print(f"\n开始：窗口期 {seconds:.0f} 秒。依次按目标键（每个 2 次，间隔约 1 秒），Ctrl-C 可提前结束。\n", flush=True)
 
     def read_evdev(dev):
         while time.monotonic() < stop_at:
@@ -145,7 +151,7 @@ def main():
         while time.monotonic() < stop_at:
             time.sleep(0.2)
             now = time.monotonic()
-            if now - last_beat >= 2.0:
+            if now - last_beat >= 1.0:
                 last_beat = now
                 with lock:
                     nev, nbytes = len(events), sum(hid_bytes.values())
