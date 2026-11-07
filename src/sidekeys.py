@@ -6,6 +6,7 @@
 所有跨进程操作都在后台线程里跑，结果用 idle_add 送回主循环，界面不会冻结。
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -253,6 +254,22 @@ def load_validator():
     return None, None
 
 
+def self_fingerprint():
+    """磁盘上这份代码的指纹，用来识别「窗口跑的是旧版」。
+
+    为什么需要：安装是原地覆盖文件，旧进程内存里仍是旧代码，而重新执行
+    sidekeys 只会把激活请求转交给那个旧进程（单实例 app id），于是新代码
+    永远进不了场。实际踩到的症状：旧窗口生成旧格式 YAML（modmap 写组合键
+    字符串），被磁盘上的新校验器拒掉，用户只看到「点应用没反应」。
+    """
+    try:
+        path = getattr(sys.modules.get("__main__"), "__file__", None) or __file__
+        with open(os.path.realpath(path), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def run_in_thread(argv, callback, timeout=180):
     def work():
         try:
@@ -305,6 +322,17 @@ class SideKeysWindow(Adw.ApplicationWindow):
         start_action.connect("activate", lambda *_: self._dispatch(["start"], "服务已启动"))
         self.add_action(start_action)
         self.banner.set_property("action-name", "win.start-service")
+
+        # 旧窗口横幅：宁可挡在应用前面，也不要让「点应用没反应」变成猜谜
+        self.fingerprint = self_fingerprint()
+        self.stale_banner = Adw.Banner()
+        self.stale_banner.set_title("这个窗口跑的是旧版本代码，磁盘上的工具已经更新")
+        self.stale_banner.set_button_label("重启工具")
+        restart_action = Gio.SimpleAction.new("restart-tool", None)
+        restart_action.connect("activate", self._on_restart)
+        self.add_action(restart_action)
+        self.stale_banner.set_property("action-name", "win.restart-tool")
+        GLib.timeout_add_seconds(3, self._check_stale)
 
         rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         rows_box.set_margin_top(12)
@@ -374,6 +402,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.banner)
+        content.append(self.stale_banner)
         content.append(scrolled)
 
         self.toast = Adw.ToastOverlay()
@@ -478,7 +507,26 @@ class SideKeysWindow(Adw.ApplicationWindow):
             self.banner.set_button_label("启动服务")
             self.banner.set_revealed(True)
 
+    def _check_stale(self):
+        if not self.get_visible():
+            return False
+        current = self_fingerprint()
+        stale = self.fingerprint is not None and current is not None and current != self.fingerprint
+        self.stale_banner.set_revealed(stale)
+        return True
+
+    def _on_restart(self, *_):
+        app = self.get_application()
+        target = getattr(sys.modules.get("__main__"), "__file__", None) or __file__
+        # 必须先退场再拉新进程：app id 是单实例的，旧进程还占着名字时
+        # 新执行只会把激活转交给旧窗口，等于没重启。
+        app.set_relaunch_target(os.path.realpath(target))
+        app.quit()
+
     def _on_apply(self, _btn):
+        if self.stale_banner.get_revealed():
+            self._toast("当前窗口是旧版代码，请点横幅上的“重启工具”后再应用", error=True)
+            return
         bindings = self.current_bindings()
         device = self._selected_device()
         bad = [
@@ -556,17 +604,33 @@ def cli_mode(argv):
     return 2
 
 
+class SideKeysApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="com.andeyunhui.sidekeys")
+        self.relaunch_target = None
+
+    def set_relaunch_target(self, path):
+        self.relaunch_target = path
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--print", "--mice"):
         return cli_mode(sys.argv[1:])
-    app = Adw.Application(application_id="com.andeyunhui.sidekeys")
+    app = SideKeysApp()
 
     def activate(application):
+        # 已开窗口的实例被二次激活时只把它提到前面，不再叠一个窗口
+        for existing in application.get_windows():
+            existing.present()
+            return
         window = SideKeysWindow(application=application)
         window.present()
 
     app.connect("activate", activate)
-    return app.run(None)
+    rc = app.run(None)
+    if app.relaunch_target:
+        subprocess.Popen([sys.executable, app.relaunch_target], close_fds=True)
+    return rc
 
 
 if __name__ == "__main__":

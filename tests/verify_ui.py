@@ -118,6 +118,22 @@ def inspect_():
     after3 = buf_text(preview)
     check("自定义值进入 keymap", "BTN_EXTRA: Enter" in after3, after3.replace("\n", "\\n")[:140])
 
+    # 回归：旧窗口跑旧代码时，点应用必须明确拒绝并给出出口，而不是静默无反应
+    dispatched = []
+    real_dispatch = win._dispatch
+    win._dispatch = lambda *a, **k: dispatched.append(a)
+    original_fp = sk.self_fingerprint
+    sk.self_fingerprint = lambda: "0" * 64
+    win._check_stale()
+    check("代码更新后横幅亮起", win.stale_banner.get_revealed())
+    win._on_apply(None)
+    check("旧窗口点应用不会静默提交", dispatched == [], str(dispatched))
+    sk.self_fingerprint = original_fp
+    win.fingerprint = original_fp()
+    win._check_stale()
+    check("指纹一致时横幅收起", not win.stale_banner.get_revealed())
+    win._dispatch = real_dispatch
+
     # 回归：窗口被压矮时，预览框不能被挤扁（这就是线上“框非常矮”的那个 bug）
     win.set_size_request(-1, 480)
 
