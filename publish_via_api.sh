@@ -37,8 +37,12 @@ publish_one() { # $1 = 本地提交 sha
 
   echo "    --- 建 blob ---"
   while read -r _status path; do
-    sha=$(timeout 60 gh api -X POST "repos/$REPO/git/blobs" \
-          --input <(jq -n --arg c "$(base64 -w0 "$path")" '{content:$c, encoding:"base64"}') --jq .sha)
+    # 内容必须取自“该提交里的版本”，不能读工作区文件：
+    # 只发 HEAD 时两者恰好相同，改成按提交循环后就会错位
+    # （实测第一个提交的 CHANGELOG.md 就对不上，脚本在 blob 校验处中止）。
+    b64=$(git show "$LOCAL:$path" | base64 -w0)
+    sha=$(jq -n --arg c "$b64" '{content:$c, encoding:"base64"}' \
+          | timeout 60 gh api -X POST "repos/$REPO/git/blobs" --input - --jq .sha)
     want=$(git rev-parse "$LOCAL:$path")
     printf "      %-34s %s %s\n" "$path" "${sha:0:12}" "$([ "$sha" = "$want" ] && echo ✓ || echo ✗)"
     [ "$sha" = "$want" ] || exit 1
