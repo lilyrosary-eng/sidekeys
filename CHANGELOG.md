@@ -2,6 +2,28 @@
 
 遵循 Keep a Changelog / SemVer 风格。
 
+## 0.2.5 — 2026-11-07
+
+### 新增
+
+- **长按判定阈值可调**（100~3000 ms，默认 400 ms）：界面多出一个「长按判定」分组，生成的
+  modmap 项里写 `tap_timeout_millis`。上游默认 1000 ms 意味着“按住不足 1 秒松手都算点按”，
+  对手势来说慢得离谱；读回与预览/应用三处保持一致。
+
+### 说明（关于“长按自动释放”）
+
+- 从 v0.15.17 源码确认：多用途键进入“已按下 hold”只能靠 repeat 事件，而**鼠标按键不发 repeat 事件**
+  （上游 `event_handler.rs` 的注释明说 `BTN_RIGHT does not emit repeat events, so mouse buttons
+  can't be remapped this way`），且 `Event::Tick` 在 event handler 里被显式忽略（只服务 operators）。
+  所以侧键的 `held` 只能在松手时判定，届时发的是**按下+释放成对**，键不会压在手里。
+  能调的只有阈值，故本版本开放它；`free_hold: true` 会让鼠标长按永远不触发，校验器直接拒绝。
+
+### 变更
+
+- 校验器优先使用与 GUI **同目录**的那一份：系统里的 `/usr/local/lib/sidekeys/sidekeys_validate.py`
+  可能落后于 GUI 版本，会把新版合法写法（如 `tap_timeout_millis`）判成“不认识的键”。
+  `install.sh` 现在也把校验器装进用户 bin 目录。
+
 ## 0.2.4 — 2026-11-07
 
 ### 修复（线上事故：点“应用”没有任何反应）

@@ -21,6 +21,13 @@ except ImportError:  # 没有 python-evdev 时退化为只做结构检查
 import yaml
 
 TRIGGER_PREFIX = ("BTN_",)
+# 与 GUI 侧保持一致的长按阈值可用范围
+HOLD_TIMEOUT_MIN = 100
+HOLD_TIMEOUT_MAX = 3000
+HOLD_TIMEOUT_SLOTS = (
+    "tap_timeout_millis", "tap_timeout", "alone_timeout_millis",
+    "hold_threshold_millis", "held_threshold_millis",
+)
 MODIFIERS = {
     "c", "ctrl", "control", "c_l", "c_r", "ctrl_l", "ctrl_r", "control_l", "control_r",
     "s", "shift", "s_l", "s_r", "shift_l", "shift_r",
@@ -151,7 +158,10 @@ def _walk_action(value, where, errors, known):
         for k, v in value.items():
             if k in ("double", "timeout", "held", "alone", "tap", "sleep", "delay_millis",
                      "throttle_ms", "bypass", "escape_next_key", "repress", "remap", "keypress",
-                     "set_mode", "launch", "close_apps", "cancel_on", "repeat", "press", "release"):
+                     "set_mode", "launch", "close_apps", "cancel_on", "repeat", "press", "release",
+                     "tap_timeout_millis", "tap_timeout", "alone_timeout_millis",
+                     "hold_threshold_millis", "held_threshold_millis",
+                     "free_hold", "interruptable"):
                 if k in ("held", "alone", "double", "keypress", "repeat", "press", "release",
                          "remap", "launch", "close_apps"):
                     _walk_action(v, f"{where}.{k}", errors, known)
@@ -193,6 +203,20 @@ def _check_modmap_shape(code, target, errors):
                               f"要序列请放进点按（keymap）")
             for item in value:
                 check_token(str(item), f"modmap {where} 数组项", errors, _known_names())
+    # 长按阈值：xremap 只在松手时判定长按（鼠标键不发 repeat 事件，Tick 对 modmap 无效），
+    # 所以“按住多久算长按”是这里唯一有意义的旋钮。
+    for slot in HOLD_TIMEOUT_SLOTS:
+        if slot not in target:
+            continue
+        value = target[slot]
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"modmap {code}.{slot}: 必须是整数毫秒，收到 {value!r}")
+        elif not HOLD_TIMEOUT_MIN <= value <= HOLD_TIMEOUT_MAX:
+            errors.append(f"modmap {code}.{slot}: {value}ms 超出可用范围 "
+                          f"{HOLD_TIMEOUT_MIN}~{HOLD_TIMEOUT_MAX}ms")
+    if target.get("free_hold") is True:
+        errors.append(f"modmap {code}.free_hold: true 会让这个鼠标侧键的长按永远不触发——"
+                      f"它靠 repeat 事件提前生效，而鼠标键不发 repeat 事件（上游注释确认）")
 
 
 def _walk_block(block, section, errors, known):

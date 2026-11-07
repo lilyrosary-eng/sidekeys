@@ -24,11 +24,20 @@ from gi.repository import Adw, Gio, GLib, Gtk
 CONFIG_PATH = "/etc/xremap/config.yml"
 STAGE_PATH = f"/tmp/sidekeys-stage-{os.getuid()}.yml"
 APPLY_HELPER = "/usr/local/bin/sidekeys-apply"
-VALIDATOR_PATHS = ("/usr/local/lib/sidekeys/sidekeys_validate.py", os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidekeys_validate.py"))
+# 先找与 GUI 同目录的那一份：规则必须和生成器同版本，
+# 否则旧的系统校验器会把新版合法写法（例如 tap_timeout_millis）判成未知键。
+VALIDATOR_PATHS = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidekeys_validate.py"),
+                   "/usr/local/lib/sidekeys/sidekeys_validate.py")
 UNIT = "sidekeys"
 NO_DEVICE = "（没检测到鼠标设备）"
 NONE_LABEL = "（不启用）"
 DOUBLE_TIMEOUT = 200
+# 长按阈值（tap_timeout_millis）：按住超过这个时长再松手才判定为“长按”。
+# 上游默认 1000ms，对手势来说太长；下限 100ms 是因为比这更短的按住
+# 和普通点击已经分不开了，上限 3000ms 是因为再长就没人会这么用。
+HOLD_TIMEOUT_DEFAULT = 400
+HOLD_TIMEOUT_MIN = 100
+HOLD_TIMEOUT_MAX = 3000
 
 # 下拉里的预设：显示名 -> xremap 写法
 PRESETS = [
@@ -141,7 +150,17 @@ def _unchord(value):
     return str(value)
 
 
-def dump_yaml(bindings, device):
+def _hold_timeout_ms(value):
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"长按阈值必须是整数毫秒，收到 {value!r}") from None
+    if not HOLD_TIMEOUT_MIN <= ms <= HOLD_TIMEOUT_MAX:
+        raise ValueError(f"长按阈值只能在 {HOLD_TIMEOUT_MIN}~{HOLD_TIMEOUT_MAX} 毫秒之间")
+    return ms
+
+
+def dump_yaml(bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT):
     keymap_remap = {}
     modmap_remap = {}
     expmap_remap = {}
@@ -149,8 +168,14 @@ def dump_yaml(bindings, device):
         b = bindings[code]
         tap, hold, dbl = b.get("tap"), b.get("hold"), b.get("double")
         if hold:
-            # 有长按时，点按走 modmap 的 alone，避免同一键在两层各说一遍
-            modmap_remap[code] = {"alone": _chord(tap), "held": _chord(hold)}
+            # 有长按时，点按走 modmap 的 alone，避免同一键在两层各说一遍。
+            # tap_timeout_millis 必写：默认的 1000ms 意味着“按住 1 秒以内松手都算点按”，
+            # 想快速长按的人会被判成粘贴。
+            modmap_remap[code] = {
+                "alone": _chord(tap),
+                "held": _chord(hold),
+                "tap_timeout_millis": _hold_timeout_ms(hold_timeout),
+            }
         elif tap is not None:
             keymap_remap[code] = _val(tap) if tap else []
         if dbl:
@@ -179,13 +204,15 @@ def dump_yaml(bindings, device):
 
 
 def read_current():
+    """返回 (绑定, 设备, 长按阈值)。阈值取线上配置里第一个出现的 tap_timeout_millis。"""
     bindings = {k: dict(v) for k, v in DEFAULT_BINDINGS.items()}
     device = None
+    hold_timeout = None
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError):
-        return bindings, device
+        return bindings, device, hold_timeout
 
     def token_of(value):
         if value is None or value == []:
@@ -209,6 +236,8 @@ def read_current():
                 bindings[code]["tap"] = _unchord(target["alone"])
             if "held" in target:
                 bindings[code]["hold"] = _unchord(target["held"])
+            if hold_timeout is None and isinstance(target.get("tap_timeout_millis"), int):
+                hold_timeout = target["tap_timeout_millis"]
         only = (block.get("device") or {}).get("only")
         if only and not device:
             device = str(only[0])
@@ -216,7 +245,7 @@ def read_current():
         for code, target in (block.get("remap") or {}).items():
             if code in bindings and isinstance(target, dict) and "double" in target:
                 bindings[code]["double"] = token_of(target["double"])
-    return bindings, device
+    return bindings, device, hold_timeout
 
 
 def list_mice():
@@ -302,7 +331,8 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.set_default_size(580, 760)
         self.busy = False
         self.validate_fn, self.semantic_fn = load_validator()
-        bindings, device = read_current()
+        bindings, device, hold_timeout = read_current()
+        self.hold_timeout = hold_timeout if isinstance(hold_timeout, int) else HOLD_TIMEOUT_DEFAULT
 
         self.header = Adw.HeaderBar()
         self.title_widget = Adw.WindowTitle(title="侧键映射", subtitle="")
@@ -358,6 +388,27 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
                 self.rows[(code, kind)] = (combo, entry, labels)
             rows_box.append(group)
+
+        # 长按阈值：xremap 的 held 对鼠标键只能在松手时判定（鼠标键不发 repeat 事件），
+        # 所以能调的只有“按住多久才算长按”。上游默认 1000ms，慢到没人会按住一秒再松手。
+        hold_group = Adw.PreferencesGroup(
+            title="长按判定", description="长按的动作在松手那一刻发出；按住不足阈值会算成点按"
+        )
+        self.hold_adjustment = Gtk.Adjustment(
+            value=self.hold_timeout,
+            lower=HOLD_TIMEOUT_MIN,
+            upper=HOLD_TIMEOUT_MAX,
+            step_increment=50,
+            page_increment=200,
+        )
+        self.hold_row = Adw.SpinRow(
+            title="长按阈值（毫秒）",
+            subtitle="上游默认 1000；调小更容易触发长按，但太小时慢一点的点击会被误判",
+            adjustment=self.hold_adjustment,
+        )
+        self.hold_row.connect("notify::value", lambda *_: self._update_preview())
+        hold_group.add(self.hold_row)
+        rows_box.append(hold_group)
 
         dev_group = Adw.PreferencesGroup(title="作用范围")
         self.device_model = Gtk.StringList.new([])
@@ -487,7 +538,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
     def _update_preview(self):
         bindings = self.current_bindings()
         try:
-            payload = dump_yaml(bindings, self._selected_device())
+            payload = dump_yaml(bindings, self._selected_device(), self.hold_row.get_value())
         except ValueError as exc:
             self.title_widget.set_subtitle(f"写法有误：{exc}")
             return
@@ -542,7 +593,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
             self._toast("没有可选的鼠标设备。本工具刻意只接管单个设备，不去抓全部键盘", error=True)
             return
         try:
-            payload = dump_yaml(bindings, device)
+            payload = dump_yaml(bindings, device, self.hold_row.get_value())
         except ValueError as exc:
             self._toast(str(exc), error=True)
             return
@@ -593,9 +644,9 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
 
 def cli_mode(argv):
-    bindings, device = read_current()
+    bindings, device, hold_timeout = read_current()
     if argv[0] == "--print":
-        sys.stdout.write(dump_yaml(bindings, device))
+        sys.stdout.write(dump_yaml(bindings, device, hold_timeout))
         return 0
     if argv[0] == "--mice":
         print("\n".join(list_mice()))

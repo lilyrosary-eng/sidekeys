@@ -35,7 +35,8 @@ def buf_text(view):
         return buf.get_text(start, end, False)
 
 
-bindings, device = sk.read_current()
+bindings, device, hold_timeout = sk.read_current()
+hold_ms = hold_timeout if isinstance(hold_timeout, int) else sk.HOLD_TIMEOUT_DEFAULT
 app = Adw.Application(application_id="com.andeyunhui.sidekeys.test")
 win = None
 
@@ -75,8 +76,25 @@ def inspect_():
     ph = win.preview_scroll.get_height()
     _m, nh, _p, _n = win.preview_scroll.measure(Gtk.Orientation.VERTICAL, -1)
     check(f"预览框实际高度不被压扁（实测 {ph}px，自然高度 {nh}px）", ph >= 160, f"ph={ph} nh={nh}")
-    check("预览与生成器一致", text == sk.dump_yaml(bindings, device), text.replace("\n", "\\n")[:70])
+    check("预览与生成器一致", text == sk.dump_yaml(bindings, device, hold_ms), text.replace("\n", "\\n")[:70])
     check("预览含侧键码", "BTN_SIDE" in text and "BTN_EXTRA" in text)
+
+    # 长按阈值控件：初始值等于线上配置（没有则用工具默认值），改动要立刻反映到预览
+    check("长按阈值初值等于线上配置", int(win.hold_row.get_value()) == hold_ms,
+          f"行={win.hold_row.get_value()} 线上={hold_ms}")
+    check("阈值行出现在长按判定分组里", any("长按" in t for t in titles), str(titles))
+    check("长按阈值可调范围为 100~3000",
+          (win.hold_adjustment.get_lower(), win.hold_adjustment.get_upper()) == (100, 3000),
+          f"{win.hold_adjustment.get_lower()}~{win.hold_adjustment.get_upper()}")
+    hcombo, hentry, hlabels = win.rows[("BTN_EXTRA", "hold")]
+    saved = hcombo.get_selected()
+    hcombo.set_selected(hlabels.index("回车 / 执行"))
+    win.hold_adjustment.set_value(250)
+    with_timeout = buf_text(preview)
+    check("有长按时预览写入 tap_timeout_millis", "tap_timeout_millis: 250" in with_timeout,
+          with_timeout.replace("\n", "\\n")[-90:])
+    hcombo.set_selected(saved)
+    win.hold_adjustment.set_value(hold_ms)
 
     title = next(w for w in widgets if isinstance(w, Adw.WindowTitle))
     check("标题栏副标题显示当前绑定", "点按" in title.get_subtitle(), title.get_subtitle())

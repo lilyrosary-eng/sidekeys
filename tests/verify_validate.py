@@ -61,6 +61,18 @@ check("拦住未知修饰键", bool(errs_of(cfg(BTN_SIDE={"tap": "Hyper-x"}))))
 check("拦住未知顶层区块", bool(errs_of(cfg(BTN_SIDE={"tap": "C-c"}) + "foobar: 1\n")))
 check("拦住空文件", bool(errs_of("")))
 check("拦住两个侧键都没绑定", bool(errs_of(cfg())))
+# 长按阈值的边界：越界/非整数/free_hold 都必须拦下（free_hold 会让鼠标长按永远不触发）
+check("拦住越界的长按阈值", any("tap_timeout_millis" in x for x in
+                              errs_of(cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
+                                      .replace("tap_timeout_millis: 400", "tap_timeout_millis: 5000"))))
+check("拦住非整数的长按阈值", any("tap_timeout_millis" in x for x in
+                               errs_of(cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
+                                       .replace("tap_timeout_millis: 400", 'tap_timeout_millis: "fast"'))))
+check("拦住 free_hold（鼠标键不发 repeat，长按会静默失效）", any("free_hold" in x for x in
+      errs_of(cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
+              .replace("tap_timeout_millis: 400", "free_hold: true"))))
+check("放行范围内的长按阈值", not errs_of(cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
+                                .replace("tap_timeout_millis: 400", "tap_timeout_millis: 250")))
 
 # ---------- 2b) modmap 的真实坑（线上事故根因，实测 xremap 会静默忽略）----------
 check("拦住 modmap 里的组合字符串", any("数组" in x and "modmap" in x for x in errs_of('''modmap:
@@ -99,7 +111,14 @@ one = cfg(BTN_SIDE={"tap": "C-c"})
 check("只有点按 → 只写 keymap", sections(one) == {"keymap"}, str(sections(one)))
 two = cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
 check("有点按+长按 → 只写 modmap，不重复写 keymap", sections(two) == {"modmap"}, str(sections(two)))
-check("长按生成 alone/held 结构", remap_of(two, "modmap")["BTN_SIDE"] == {"alone": ["CTRL_L", "c"], "held": ["CTRL_L", "x"]}, str(two))
+check("长按生成 alone/held 结构", remap_of(two, "modmap")["BTN_SIDE"]
+      == {"alone": ["CTRL_L", "c"], "held": ["CTRL_L", "x"], "tap_timeout_millis": 400}, str(two))
+check("有长按就必写长按阈值（不能沿用上游 1000ms 默认）",
+      "tap_timeout_millis" in two, str(two))
+check("只有点按时不写阈值", "tap_timeout_millis" not in one, one.replace("\n", "\\n")[:90])
+check("阈值可传参", "tap_timeout_millis: 250" in
+      sk.dump_yaml({"BTN_SIDE": {"tap": "C-c", "hold": "C-x"},
+                    "BTN_EXTRA": {"tap": None, "hold": None, "double": None}}, "Test Mouse", 250))
 mixed = cfg(BTN_SIDE={"tap": "C-c"}, BTN_EXTRA={"tap": "S-Insert", "hold": "Enter"})
 check("两键分工不同 → keymap 与 modmap 并存", sections(mixed) == {"keymap", "modmap"}, str(sections(mixed)))
 check("keymap 里只放没有长按的那个键", set(remap_of(mixed, "keymap")) == {"BTN_SIDE"}, str(remap_of(mixed, "keymap")))
@@ -119,10 +138,11 @@ with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf
     p = fh.name
 old, sk.CONFIG_PATH = sk.CONFIG_PATH, p
 try:
-    got, dev = sk.read_current()
+    got, dev, ht = sk.read_current()
 finally:
     sk.CONFIG_PATH = old
 os.unlink(p)
+check("round-trip 长按阈值", ht == 400, str(ht))
 check("round-trip 点按", got["BTN_SIDE"]["tap"] == "C-c", str(got))
 check("round-trip 长按", got["BTN_SIDE"]["hold"] == "C-x", str(got))
 check("round-trip 双击", got["BTN_SIDE"]["double"] == "Enter", str(got))

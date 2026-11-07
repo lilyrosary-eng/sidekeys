@@ -49,12 +49,16 @@ first_mouse() {
 echo "== 1. 用户侧（GUI + 桌面入口）=="
 install -d -m 0755 "$DEST_BIN" "$DEST_APPS"
 install -m 0755 "$REPO/src/sidekeys.py" "$DEST_BIN/sidekeys"
+# 校验器跟 GUI 同目录放一份：GUI 必须用与自己版本一致的规则，
+# 否则旧的系统校验器会把新版生成的合法写法判成“不认识的键”。
+install -m 0644 "$REPO/src/sidekeys_validate.py" "$DEST_BIN/sidekeys_validate.py"
 sed "s|@BINDIR@|${DEST_BIN}|" "$REPO/data/com.andeyunhui.sidekeys.desktop.in" \
   > "$DEST_APPS/com.andeyunhui.sidekeys.desktop"
 chmod 0644 "$DEST_APPS/com.andeyunhui.sidekeys.desktop"
 # 以 root 跑时，这些文件落在别人家目录里，必须把属主还给那个用户
 if [ "$UID_NUM" = 0 ]; then
   chown "$TARGET_USER" "$DEST_BIN" "$DEST_APPS" "$DEST_BIN/sidekeys" \
+    "$DEST_BIN/sidekeys_validate.py" \
     "$DEST_APPS/com.andeyunhui.sidekeys.desktop"
 fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$DEST_APPS" 2>/dev/null || true
