@@ -158,6 +158,10 @@ python3 /usr/local/lib/sidekeys/sidekeys_validate.py /etc/xremap/config.yml
 "$XREMAP_BIN" --validate-config /etc/xremap/config.yml
 
 systemctl daemon-reload
+# 两个引擎互斥：它们都靠 EVIOCGRAB 独占同一只鼠标，同时跑就是一方静默收不到事件。
+# apt install keyd / kanata 会自动 enable+start 它们的单元，所以这里显式让位给本工具。
+systemctl disable --now keyd >/dev/null 2>&1 || true
+systemctl disable --now kanata >/dev/null 2>&1 || true
 systemctl enable --now "$UNIT"
 sleep 2
 
