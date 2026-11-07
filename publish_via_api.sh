@@ -54,8 +54,20 @@ publish_one() { # $1 = 本地提交 sha
     sha=$(git rev-parse "$LOCAL:$p")
     printf '{"path":"%s","mode":"%s","type":"blob","sha":"%s"},' "$p" "$mode" "$sha"
   done | sed 's/,$//')
-  NT=$(printf '%s' "$ENTRIES" | jq -n --arg base "$RT" --argjson t "[$ENTRIES]" '{base_tree:$base, tree:$t}' \
-       | timeout 60 gh api -X POST "repos/$REPO/git/trees" --input - --jq .sha)
+  NT=""
+  for attempt in 1 2 3 4 5; do
+    if NT=$(printf '%s' "$ENTRIES" | jq -n --arg base "$RT" --argjson t "[$ENTRIES]" '{base_tree:$base, tree:$t}' \
+            | timeout 60 gh api -X POST "repos/$REPO/git/trees" --input - --jq .sha 2>/tmp/tree_err); then
+      break
+    fi
+    # 实测过：刚建完 blob 立刻建 tree，GitHub 会回 “tree.sha … is not a valid blob”，
+    # 但那个 sha 用 /git/blobs 查是合法的 blob —— git 后端还没同步完。重试即可，
+    # 别把它当成内容错误去改打包逻辑。
+    echo "      tree 第 $attempt 次失败：$(head -c 120 /tmp/tree_err)"
+    NT=""
+    sleep 3
+  done
+  [ -n "$NT" ] || { echo "✗ 建 tree 连续失败，中止（远端 main 未动）" >&2; exit 1; }
   LT=$(git rev-parse "$LOCAL^{tree}")
   printf "      远端算出 %s 本地 %s %s\n" "${NT:0:12}" "${LT:0:12}" "$([ "$NT" = "$LT" ] && echo ✓ || echo ✗)"
   [ "$NT" = "$LT" ] || { echo "✗ tree 不一致，中止"; exit 1; }
