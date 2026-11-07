@@ -94,7 +94,23 @@ def main():
         print(f"    {i}…", flush=True)
         time.sleep(1)
     stop_at = time.monotonic() + seconds
-    print(f"\n开始：窗口期 {seconds:.0f} 秒。依次按目标键（每个 2 次，间隔约 1 秒），Ctrl-C 可提前结束。\n", flush=True)
+    print(f"\n开始：窗口期 {seconds:.0f} 秒。按你在窗口期前读到的那张表执行（这里不重复规定动作，避免两套指令互相覆盖），Ctrl-C 可提前结束。\n", flush=True)
+    print("时间列 = 相对窗口内第一条事件的毫秒差（内核时间戳）；前缀 ~ 表示该事件没有内核时间戳，退回读取时刻。\n", flush=True)
+
+    origin = [None]
+
+    def event_stamp(ev):
+        try:
+            ts = ev.timestamp()
+        except Exception:
+            ts = None
+        if ts is None:
+            return "~" + datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        with lock:
+            if origin[0] is None:
+                origin[0] = ts
+            rel = (ts - origin[0]) * 1000.0
+        return "+%8.1fms" % rel
 
     def read_evdev(dev):
         while time.monotonic() < stop_at:
@@ -102,8 +118,12 @@ def main():
                 for ev in dev.read():
                     if keys_only and ev.type != 1:
                         continue
+                    # 必须用事件自带的内核时间戳：dev.read() 一次会排空一批事件，
+                    # 如果用读取时刻，整批都会被记成同一毫秒，长按/到点触发这类
+                    # 依赖间隔判断的结论就完全没法做。
+                    stamp = event_stamp(ev)
                     line = "%s evdev %-30s %s code=%-4s %-20s value=%s" % (
-                        datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        stamp,
                         dev.name[:30], type_name(ev.type), ev.code,
                         key_name(ev.code) if ev.type == 1 else "", ev.value,
                     )
@@ -128,7 +148,7 @@ def main():
             try:
                 data = os.read(fd, 128)
                 if data:
-                    stamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    stamp = "~" + datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
                     with lock:
                         hid_bytes[path] += len(data)
                         if len(reports) < MAX_REPORTS:
@@ -172,10 +192,25 @@ def main():
     lines.append("")
     lines += reports[:MAX_REPORTS]
     body = "\n".join(lines) + "\n"
-    with open(LOG, "w", encoding="utf-8") as fh:
-        fh.write(body)
+    # 上一个窗口期可能以 root 跑过，日志就成了 root 属主；这种情况下必须照样把结果
+    # 吐到终端，而不是收集完数据却在最后一步崩掉。
+    try:
+        with open(LOG, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        location = LOG
+    except OSError as exc:
+        fallback = f"/tmp/input-probe-{os.getuid()}.log"
+        try:
+            with open(fallback, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            location = fallback
+            print(f"[写 {LOG} 失败（{exc.strerror}），已改写 {fallback}]\n")
+        except OSError as exc2:
+            location = None
+            print(f"[写日志失败：{exc2}，只在终端输出]\n")
     print(body[:5000])
-    print(f"[完整结果在 {LOG}]")
+    if location:
+        print(f"[完整结果在 {location}]")
 
 
 if __name__ == "__main__":
