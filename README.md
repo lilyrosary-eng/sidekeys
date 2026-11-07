@@ -64,8 +64,9 @@ sudo ./uninstall.sh --purge
 
 ## 界面与用法
 
-- **两个侧键各一行**：13 项预设（复制、粘贴、剪切、新开标签页、关闭标签页、浏览器后退/前进、刷新、
-  下一个/上一个窗口、锁屏、屏蔽、自定义）。选“自定义…”会出现输入行，可直接写任意 xremap 写法。
+- **两个侧键各一行**：15 项预设（复制、粘贴、剪切、复制/粘贴的终端可用变体、新开标签页、关闭标签页、
+  浏览器后退/前进、刷新、下一个/上一个窗口、锁屏、屏蔽、自定义）。选“自定义…”会出现输入行，
+  可直接写任意 xremap 写法。
 - **作用范围**：鼠标设备下拉。设备列表来自 `/proc/bus/input/devices`（**不需要任何权限**），
   并且会过滤掉虚拟设备——包括 xremap 自己创建的输出设备，映射它会形成回环。
 - **只读 YAML 预览**：保存前你能看到将要落盘的完整内容。
@@ -84,6 +85,22 @@ sudo ./uninstall.sh --purge
 | `{launch: ["notify-send", "hi"]}` | 启动程序 —— **在当前部署下不要用，见“已知限制”** |
 
 在序列前加 `throttle_ms: 10` 可以给事件之间留间隔，某些应用需要。
+
+### 终端里 Ctrl+C 不管用——这是正确的，不是 bug
+
+终端模拟器把 `Ctrl+C` 交给 shell 当 SIGINT、把 `Ctrl+V` 当“字面插入下一个字符”，所以“复制/粘贴”在终端里必须换一套写法。两个选择：
+
+**办法一（推荐，不需要任何扩展）**：把侧键设成 PC 传统的剪贴板键
+
+- `C-Insert` = 复制，`S-Insert` = 粘贴；GUI 预设里叫“复制（终端里也能用）/ 粘贴（终端里也能用）”。
+- 覆盖面：GTK/VTE（GNOME Terminal）、Konsole、Windows Terminal、Chromium/Firefox、LibreOffice 都认这套键。
+- 两个已知边角：只实现了 `Shift+Insert` 粘贴的精简终端会漏掉“复制”；在 xterm 里 `Shift+Insert` 粘贴的是 PRIMARY 选择，语义可能和你预期不同。
+
+**办法二（按应用区分）**：让不同应用用不同写法，需要 xremap 知道当前聚焦的是谁。
+本项目的 unit 默认 `--desktop=none`，即**不依赖桌面集成、也就没有应用感知**，所以现在写 `application:` 不会命中。
+在 GNOME Wayland 上要按应用区分，需要装 [xremap-gnome](https://extensions.gnome.org/extension/5060/xremap/) 扩展
+并把服务改成 `--desktop=gnome`（我们装的二进制已经是 gnome 变体）。要走这条路，配置就能写成
+“在 `org.gnome.Terminal` 里用 `C-S-c`，别处用 `C-c`”。
 
 ## 权限模型
 
@@ -115,6 +132,8 @@ logind 的 `uaccess` 会把 `/dev/uinput` 的 ACL `group::` 降成 `---`，于�
 
 - **`launch` 类动作不可用**：服务跑在专用 `xremap` 用户下，它启动的进程不属于你的桌面会话。
   要支持“按键启动程序”需改用 xremap 的 socket 变体（`full` 包 + `xremap-<user>` 组 + 用户侧 bridge）。
+- **默认没有应用感知**：服务以 `--desktop=none` 运行，`application:` 规则不会命中。
+  需要按应用区分时，见上面“办法二”（装 xremap-gnome 扩展 + `--desktop=gnome`）。
 - **不支持手柄**：xremap 本身没有 joystick/gamepad 支持（其文档中未出现相关能力），这不是 GUI 能补的。
 - **只覆盖两个侧键**：这是个专用小工具，不是通用重映射器。多行“任意键 → 键/组合/宏”的编辑器在计划中。
 - **不上报的厂商键无能为力**：例如某 HP OMEN 笔记本的六个宏键，其 HID 接口声明的是

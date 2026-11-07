@@ -2,6 +2,17 @@
 
 遵循 Keep a Changelog / SemVer 风格。
 
+## 0.1.1 — 2026-11-04
+
+### 新增
+
+- 预设里加入 **复制（终端里也能用）`C-Insert`** 与 **粘贴（终端里也能用）`S-Insert`**。
+  理由：终端模拟器把 `Ctrl+C` 当作 SIGINT、`Ctrl+V` 当作字面插入，所以默认的 `C-c/C-v` 在终端里
+  本来就不该生效；PC 传统剪贴板键在 VTE/Konsole/Windows Terminal/Chromium/Firefox 里都是复制与粘贴。
+  已用 `xremap --validate-config` 验证写法合法。
+- README 增加“终端里 Ctrl+C 不管用——这是正确的”一节，说明两条路（传统剪贴板键 / 按应用区分），
+  并明确当前 unit 是 `--desktop=none`，因此 `application:` 规则不会命中。
+
 ## 0.1.0 — 2026-11-03
 
 第一个公开版本。

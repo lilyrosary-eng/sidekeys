@@ -59,7 +59,8 @@ def inspect_():
     check("分组标题齐全", all(any(code in t for t in titles) for code, _ in sk.BUTTONS), str(titles))
 
     button_rows = [c for c in combos if c.get_title() == "映射为"]
-    check("侧键下拉各 13 个预设", all(c.get_model().get_n_items() == len(sk.PRESETS) for c in button_rows))
+    check(f"侧键下拉各有 {len(sk.PRESETS)} 个预设", all(c.get_model().get_n_items() == len(sk.PRESETS) for c in button_rows))
+    check("含终端里也能用的剪贴板预设", {"C-Insert", "S-Insert"} <= {v for _, v in sk.PRESETS})
     expected = {code: sk.PRESETS.index(next(p for p in sk.PRESETS if p[1] == remap[code])) for code, _ in sk.BUTTONS}
     got = {code: c.get_selected() for code, c in zip([c for c, _ in sk.BUTTONS], button_rows)}
     check("下拉初始选项 = 线上配置", got == expected, f"got={got} expect={expected}")
