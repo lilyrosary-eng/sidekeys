@@ -38,11 +38,13 @@ XREMAP_BIN=/usr/bin/xremap
 echo "   目标用户：$TARGET_USER（$TARGET_HOME）"
 
 first_mouse() {
+  # 两处可移植性坑（这台机器的 awk 是 mawk）：`\b` 不是词边界，字符类里的 `[^\n]`
+  # 也不是“非换行”。实测这两个写法让本函数永远返回空，于是设备名一丢就 exit 1，
+  # 整个安装卡在第 4 步。改成只排除空白，并用 index 显式取 Name 的值。
   awk 'BEGIN{RS=""}
-       /H: +Handlers=/ && !/Touchpad/ && !/devices\/virtual\// {
-         if (match($0, /H: +Handlers=[^\n]*\bmouse[0-9]/) && match($0, /N: +Name="[^"]+"/)) {
-           print substr($0, RSTART + 9, RLENGTH - 10); exit
-         }
+       /H: Handlers=[^ ]*mouse[0-9]/ && !/Touchpad/ && !/devices\/virtual\// {
+         n = index($0, "Name=\"");
+         if (n) { rest = substr($0, n + 6); q = index(rest, "\""); print substr(rest, 1, q - 1); exit }
        }' /proc/bus/input/devices
 }
 
@@ -117,25 +119,35 @@ else
   echo "   已存在，保留不覆盖"
 fi
 
-# 设备名以 config.yml 为准同步进环境文件，避免 unit 与实际接管对象不一致
+# 设备名以 config.yml 为准同步进环境文件，避免 unit 与实际接管对象不一致。
+# 三个区块都要找：两个键都绑了长按时本工具生成的配置里根本没有 keymap 块，
+# 只看 keymap 会得出“设备名未知”，进而把整个安装卡死在第 4 步。
 if command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null; then
   DEV="$(python3 - <<'PY'
 import yaml
+
 doc = yaml.safe_load(open("/etc/xremap/config.yml", encoding="utf-8")) or {}
-for b in doc.get("keymap") or []:
-    only = (b.get("device") or {}).get("only") or []
-    if only:
-        print(only[0]); break
+for section in ("keymap", "modmap", "experimental_map"):
+    for block in doc.get(section) or []:
+        only = (block.get("device") or {}).get("only") or []
+        if only:
+            print(only[0])
+            raise SystemExit(0)
 PY
 )"
 else
   DEV="$(awk '/^ *only:/{f=1;next} f&&/^ *- /{sub(/^ *- /,"");print;exit}' /etc/xremap/config.yml)"
 fi
 [ -n "$DEV" ] || DEV="$(first_mouse)"
-[ -n "$DEV" ] || { echo "仍无法确定设备名；请手动写 /etc/xremap/sidekeys.env" >&2; exit 1; }
-printf 'SIDEKEYS_DEVICE="%s"\n' "$DEV" > /etc/xremap/sidekeys.env
-chmod 0644 /etc/xremap/sidekeys.env
-echo "   接管设备：$DEV"
+if [ -z "$DEV" ]; then
+  # 设备名解析不出来不该让整个安装失败：root 侧的助手/校验器/单元比这一步更要紧，
+  # 而环境文件里的旧值仍然有效。警告后沿用原值继续装。
+  echo "   警告：无法确定设备名，保留现有 /etc/xremap/sidekeys.env 不改" >&2
+else
+  printf 'SIDEKEYS_DEVICE="%s"\n' "$DEV" > /etc/xremap/sidekeys.env
+  chmod 0644 /etc/xremap/sidekeys.env
+  echo "   接管设备：$DEV"
+fi
 
 install -m 0644 "$REPO/contrib/99-sidekeys-uinput.rules" /etc/udev/rules.d/
 echo uinput > /etc/modules-load.d/uinput.conf
