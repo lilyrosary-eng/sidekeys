@@ -116,8 +116,11 @@ GUI 与 root 助手共用同一个校验器，界面当场拦下、助手再兜�
 **办法一（推荐，不需要任何扩展）**：把侧键设成 PC 传统的剪贴板键
 
 - `C-Insert` = 复制，`S-Insert` = 粘贴；GUI 预设里叫“复制（终端里也能用）/ 粘贴（终端里也能用）”。
-- 覆盖面：GTK/VTE（GNOME Terminal）、Konsole、Windows Terminal、Chromium/Firefox、LibreOffice 都认这套键。
-- 两个已知边角：只实现了 `Shift+Insert` 粘贴的精简终端会漏掉“复制”；在 xterm 里 `Shift+Insert` 粘贴的是 PRIMARY 选择，语义可能和你预期不同。
+- 覆盖面**没有想象中广**，请把这两项当作“某些终端可用”而不是通用方案：VTE 系（GNOME Terminal、kgx）、
+  Konsole、Windows Terminal 一般认 `Shift+Insert` 粘贴；`Ctrl+Insert` 复制在不少 GTK4 原生控件和
+  代码编辑器里没有绑定；装了中文输入法时 `Shift` 还可能被输入法吃掉。
+- 所以默认仍建议 `C-c`/`C-v`（覆盖最广），终端里改用终端自己的 `Ctrl+Shift+c/v`，
+  需要真正做到“按应用区分”得上应用感知（见“办法二”）。
 
 **办法二（按应用区分）**：让不同应用用不同写法，需要 xremap 知道当前聚焦的是谁。
 本项目的 unit 默认 `--desktop=none`，即**不依赖桌面集成、也就没有应用感知**，所以现在写 `application:` 不会命中。

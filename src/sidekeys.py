@@ -34,8 +34,8 @@ PRESETS = [
     ("复制", "C-c"),
     ("粘贴", "C-v"),
     ("剪切", "C-x"),
-    ("复制（终端里也能用）", "C-Insert"),
-    ("粘贴（终端里也能用）", "S-Insert"),
+    ("复制（仅部分终端绑定）", "C-Insert"),
+    ("粘贴（仅部分终端绑定）", "S-Insert"),
     ("回车 / 执行", "Enter"),
     ("新开标签页", "C-S-T"),
     ("关闭标签页", "C-w"),
@@ -284,8 +284,14 @@ class SideKeysWindow(Adw.ApplicationWindow):
         adv_group = Adw.PreferencesGroup(title="将写入的 YAML", description="只读预览；点“应用”才会写入并生效")
         preview_scroll = Gtk.ScrolledWindow()
         preview_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        preview_scroll.set_propagate_natural_height(True)
-        preview_scroll.set_max_content_height(260)
+        # 外层本身就是可滚动容器，propagate_natural_height 会让这里按最小值算而被压扁；
+        # 所以显式给 min/max 高度，并关掉 propagate。
+        preview_scroll.set_propagate_natural_height(False)
+        preview_scroll.set_min_content_height(200)
+        preview_scroll.set_max_content_height(280)
+        preview_scroll.set_size_request(-1, 200)
+        preview_scroll.set_vexpand(False)
+        self.preview_scroll = preview_scroll
         self.preview_text = Gtk.TextView(editable=False, monospace=True, cursor_visible=False)
         self.preview_text.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         preview_scroll.set_child(self.preview_text)

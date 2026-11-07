@@ -72,6 +72,9 @@ def inspect_():
 
     preview = next(w for w in widgets if isinstance(w, Gtk.TextView))
     text = buf_text(preview)
+    ph = win.preview_scroll.get_height()
+    _m, nh, _p, _n = win.preview_scroll.measure(Gtk.Orientation.VERTICAL, -1)
+    check(f"预览框实际高度不被压扁（实测 {ph}px，自然高度 {nh}px）", ph >= 160, f"ph={ph} nh={nh}")
     check("预览与生成器一致", text == sk.dump_yaml(bindings, device), text.replace("\n", "\\n")[:70])
     check("预览含侧键码", "BTN_SIDE" in text and "BTN_EXTRA" in text)
 
@@ -93,6 +96,10 @@ def inspect_():
 
     # 交互：自定义 → 输入行可见且进入预览；非法键名被校验器拦住
     tcombo, tentry, tlabels = win.rows[("BTN_EXTRA", "tap")]
+    xh, _xhe, xl = win.rows[("BTN_EXTRA", "hold")]
+    xh.set_selected(xl.index(sk.NONE_LABEL))
+    xd, _xde, xdl = win.rows[("BTN_EXTRA", "double")]
+    xd.set_selected(xdl.index(sk.NONE_LABEL))
     tcombo.set_selected(tlabels.index(sk.CUSTOM_LABEL))
     check("选自定义后输入行可见", tentry.get_visible())
     tentry.set_text("Return")
@@ -106,10 +113,18 @@ def inspect_():
     check("校验器拦下界面上的 Return", any("Enter" in x for x in errs), str(errs)[:120])
     tentry.set_text("Enter")
     after3 = buf_text(preview)
-    check("自定义值进入预览", "BTN_EXTRA: Enter" in after3 or "- Enter" in after3, after3.replace("\n", "\\n")[:90])
+    check("自定义值进入 keymap", "BTN_EXTRA: Enter" in after3, after3.replace("\n", "\\n")[:140])
 
-    app.quit()
-    return False
+    # 回归：窗口被压矮时，预览框不能被挤扁（这就是线上“框非常矮”的那个 bug）
+    win.set_size_request(-1, 480)
+
+    def check_small_window():
+        h2 = win.preview_scroll.get_height()
+        check(f"窗口压到 480px 高时预览框仍 >=160px（实测 {h2}px）", h2 >= 160, f"h={h2}")
+        app.quit()
+        return False
+
+    GLib.timeout_add(400, check_small_window)
 
 
 app.connect("activate", on_activate)
