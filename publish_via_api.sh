@@ -85,11 +85,22 @@ publish_one() { # $1 = 本地提交 sha
 }
 
 if [ $# -ge 1 ]; then
+  RANGE="$1..HEAD"
+  # 传进来的必须是**本地**存在的提交：走 API 发布时远端 sha 与本地 sha 不同，
+  # 拿远端 sha 当起点会让 git rev-list 报错。而 `for c in $(git rev-list ...)` 里
+  # 命令替换失败并不触发 set -e —— 实测它就“发布了 0 个提交”然后打印完成，
+  # 把失败说成成功。这里显式校验，宁可拒绝。
+  if ! git rev-list --count "$RANGE" >/dev/null 2>&1; then
+    echo "✗ 起点不是本地提交（或区间无提交）：$RANGE" >&2
+    echo "  远端 sha 与本地 sha 不同，请用本地提交号或 HEAD^；查看本地序列：git log --oneline -8" >&2
+    exit 1
+  fi
   count=0
-  for c in $(git rev-list --reverse "$1..HEAD"); do
+  for c in $(git rev-list --reverse "$RANGE"); do
     publish_one "$c"
     count=$((count + 1))
   done
+  [ "$count" -gt 0 ] || { echo "✗ 区间里没有待发布的提交（$RANGE）—— 这不该被当成成功" >&2; exit 1; }
   echo "共发布 $count 个提交"
 else
   publish_one "$(git rev-parse HEAD)"
