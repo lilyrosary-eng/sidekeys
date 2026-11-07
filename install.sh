@@ -136,13 +136,17 @@ udevadm control --reload-rules
 udevadm trigger --action=change --sysname-match=uinput || true
 
 echo
-echo "== 5. 助手、polkit 策略与 systemd 服务 =="
+echo "== 5. 助手、校验器、polkit 策略与 systemd 服务 =="
 install -m 0755 "$REPO/src/sidekeys-apply" /usr/local/bin/sidekeys-apply
 install -m 0755 "$REPO/contrib/sidekeys-run" /usr/local/bin/sidekeys-run
+install -d -m 0755 /usr/local/lib/sidekeys
+install -m 0644 "$REPO/src/sidekeys_validate.py" /usr/local/lib/sidekeys/sidekeys_validate.py
 install -m 0644 "$REPO/data/org.andeyunhui.sidekeys.policy" /usr/share/polkit-1/actions/
 install -m 0644 "$REPO/contrib/sidekeys.service" "/etc/systemd/system/${UNIT}.service"
 bash -n /usr/local/bin/sidekeys-apply
 bash -n /usr/local/bin/sidekeys-run
+python3 -c 'import yaml' 2>/dev/null || { echo "缺 python3-yaml（Ubuntu: apt install python3-yaml）" >&2; exit 1; }
+python3 /usr/local/lib/sidekeys/sidekeys_validate.py /etc/xremap/config.yml
 "$XREMAP_BIN" --validate-config /etc/xremap/config.yml
 
 systemctl daemon-reload

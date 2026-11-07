@@ -13,7 +13,7 @@
   `--mouse` + `--device` 单设备限定、`MemoryHigh/MemoryMax`、`IPAddressDeny`。
 - `contrib/99-sidekeys-uinput.rules` —— 其中一行内核规则改写自
   xremap 的 `doc/running_without_sudo.md`（MIT）；注释里补了 Ubuntu/GNOME 上单靠该规则不够的原因。
-- `src/sidekeys-apply`、`src/sidekeys.py`、`contrib/sidekeys-run`、`data/*` 不含来自 xremap 的代码；
+- `src/sidekeys-apply`、`src/sidekeys.py`、`src/sidekeys_validate.py`、`contrib/sidekeys-run`、`data/*` 不含来自 xremap 的代码；
   校验、语义防护、备份/回滚、设备名白名单、图形界面均为本仓库原创实现。
 
 MIT 要求保留版权声明与许可声明，故再分发本仓库（含 `contrib/` 派生片段）时请一并保留本文件与 `LICENSE`。

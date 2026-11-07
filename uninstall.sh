@@ -50,6 +50,7 @@ systemctl disable "$UNIT" 2>/dev/null || true
 rm -f "/etc/systemd/system/${UNIT}.service"
 rm -f /usr/local/bin/sidekeys-apply
 rm -f /usr/local/bin/sidekeys-run
+rm -rf /usr/local/lib/sidekeys
 rm -f /usr/share/polkit-1/actions/org.andeyunhui.sidekeys.policy
 rm -f /etc/udev/rules.d/99-sidekeys-uinput.rules
 rm -f /etc/modules-load.d/uinput.conf

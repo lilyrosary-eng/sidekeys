@@ -14,6 +14,7 @@ CONF=/etc/xremap/config.yml
 ENVF=/etc/xremap/sidekeys.env
 BACKUP=/etc/xremap/config.yml.bak
 XREMAP=/usr/bin/xremap
+VALIDATOR=/usr/local/lib/sidekeys/sidekeys_validate.py
 UNIT=sidekeys
 
 die() { echo "$*" >&2; exit 1; }
@@ -49,9 +50,16 @@ case "${1:-}" in
 $out"
         fi
 
-        # 语义校验：xremap 认为“空配置”也合法，会静默取消所有映射。
-        # 本工具只管侧键，所以必须至少含一条 BTN_SIDE/BTN_EXTRA。
-        if ! python3 - "$stage" <<'PY'
+        # 深度校验：xremap 自己**不校验 modmap 里的键名**（实测 held: [TotallyBogus] 也算
+        # “Config is valid”），所以错键名会静默失效而服务照常 active。这一步补上键名与语义检查。
+        if [ -r "$VALIDATOR" ]; then
+            if ! out=$(python3 "$VALIDATOR" "$stage" 2>&1); then
+                die "配置校验未通过，已放弃写入：
+$out"
+            fi
+        else
+            # 校验器缺失时至少守住语义门：必须有一个侧键被绑定
+            if ! python3 - "$stage" <<'PY'
 import sys
 import yaml
 
@@ -59,14 +67,17 @@ try:
     doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
 except Exception:
     sys.exit(1)
-for block in doc.get("keymap") or []:
-    remap = block.get("remap") if isinstance(block, dict) else None
-    if remap and any(code in remap for code in ("BTN_SIDE", "BTN_EXTRA")):
-        sys.exit(0)
+for section in ("keymap", "modmap", "experimental_map"):
+    for block in doc.get(section) or []:
+        remap = block.get("remap") if isinstance(block, dict) else None
+        if remap and any(code in remap for code in ("BTN_SIDE", "BTN_EXTRA")):
+            sys.exit(0)
 sys.exit(1)
 PY
-        then
-            die "配置里没有任何侧键映射，拒绝写入（防止误清空现有映射）"
+            then
+                die "配置里没有任何侧键映射，拒绝写入（防止误清空现有映射）"
+            fi
+            echo "提示：缺少 $VALIDATOR，只做了最小语义检查" >&2
         fi
 
         mkdir -p "$(dirname "$CONF")"

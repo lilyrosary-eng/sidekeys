@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """侧键映射 —— xremap 两个鼠标侧键的图形配置器。
 
-不做实时按键捕获：改动只在按“应用”时一次性写入 /etc/xremap/config.yml 并重启 xremap。
+每个侧键可以绑三个手势：点按 / 长按 / 双击。
+不做实时按键捕获：改动只在按“应用”时一次性写入配置并重启服务。
 所有跨进程操作都在后台线程里跑，结果用 idle_add 送回主循环，界面不会冻结。
 """
 
@@ -22,16 +23,20 @@ from gi.repository import Adw, Gio, GLib, Gtk
 CONFIG_PATH = "/etc/xremap/config.yml"
 STAGE_PATH = f"/tmp/sidekeys-stage-{os.getuid()}.yml"
 APPLY_HELPER = "/usr/local/bin/sidekeys-apply"
+VALIDATOR_PATHS = ("/usr/local/lib/sidekeys/sidekeys_validate.py", os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidekeys_validate.py"))
 UNIT = "sidekeys"
 NO_DEVICE = "（没检测到鼠标设备）"
+NONE_LABEL = "（不启用）"
+DOUBLE_TIMEOUT = 200
 
+# 下拉里的预设：显示名 -> xremap 写法
 PRESETS = [
     ("复制", "C-c"),
     ("粘贴", "C-v"),
     ("剪切", "C-x"),
-    # 终端里 Ctrl+C 是 SIGINT、Ctrl+V 是字面插入，所以给出 PC 传统的剪贴板键
     ("复制（终端里也能用）", "C-Insert"),
     ("粘贴（终端里也能用）", "S-Insert"),
+    ("回车 / 执行", "Enter"),
     ("新开标签页", "C-S-T"),
     ("关闭标签页", "C-w"),
     ("浏览器后退", "A-Left"),
@@ -40,59 +45,110 @@ PRESETS = [
     ("下一个窗口", "A-Tab"),
     ("上一个窗口", "Shift-A-Tab"),
     ("锁屏", "Super-L"),
-    ("屏蔽这个侧键", "[]"),
+    ("屏蔽这个键", "[]"),
     ("自定义…", ""),
 ]
 CUSTOM_LABEL = PRESETS[-1][0]
 TOKEN_BY_LABEL = dict(PRESETS)
+LABEL_BY_TOKEN = {v: k for k, v in PRESETS if v}
 BUTTONS = [("BTN_SIDE", "后侧键"), ("BTN_EXTRA", "前侧键")]
-DEFAULT_REMAP = {"BTN_SIDE": "C-c", "BTN_EXTRA": "C-v"}
-
-VALID_TOKEN = re.compile(r"^[A-Za-z0-9_.+-]+$|^\[\]$")
-
-
-def label_for(token):
-    for label, value in PRESETS:
-        if value and value == token:
-            return label
-    return token or "屏蔽"
+GESTURES = [("tap", "点按"), ("hold", "长按"), ("double", "双击")]
+DEFAULT_BINDINGS = {
+    "BTN_SIDE": {"tap": "C-c", "hold": None, "double": None},
+    "BTN_EXTRA": {"tap": "C-v", "hold": None, "double": None},
+}
+VALID_TOKEN = re.compile(r"^[A-Za-z0-9_.+-]+(\s*,\s*[A-Za-z0-9_.+-]+)*$|^\[\]$")
 
 
-def dump_yaml(remap, device):
-    block = {"name": "侧键映射"}
-    if device:
-        block["device"] = {"only": [device]}
-    body = {}
+def _val(token):
+    """把界面上的写法转成 xremap 的值。
+
+    “屏蔽”是空序列 []，不是字符串 "[]"；逗号分隔表示宏序列，必须转成 YAML 列表。
+    """
+    if token is None or token == "":
+        return None
+    if token == "[]":
+        return []
+    parts = [p.strip() for p in token.split(",") if p.strip()]
+    if len(parts) > 1:
+        return parts
+    return token
+
+
+def dump_yaml(bindings, device):
+    keymap_remap = {}
+    modmap_remap = {}
+    expmap_remap = {}
     for code, _ in BUTTONS:
-        value = remap.get(code) or "[]"
-        # xremap 里“屏蔽这个键”是空序列 []，不是字符串 "[]"
-        body[code] = [] if value == "[]" else value
-    block["remap"] = body
-    header = "# 由侧键映射工具生成。手改前先用 sidekeys.py --print 看现状。\n"
-    return header + yaml.safe_dump(
-        {"keymap": [block]}, allow_unicode=True, sort_keys=False, default_flow_style=False
-    )
+        b = bindings[code]
+        tap, hold, dbl = b.get("tap"), b.get("hold"), b.get("double")
+        if hold:
+            # 有长按时，点按走 modmap 的 alone，避免同一键在两层各说一遍
+            modmap_remap[code] = {"alone": _val(tap) or [], "held": _val(hold)}
+        elif tap is not None:
+            keymap_remap[code] = _val(tap) if tap else []
+        if dbl:
+            expmap_remap[code] = {"double": _val(dbl), "timeout": DOUBLE_TIMEOUT}
+
+    doc = {}
+    if keymap_remap:
+        block = {"name": "侧键映射"}
+        if device:
+            block["device"] = {"only": [device]}
+        block["remap"] = keymap_remap
+        doc["keymap"] = [block]
+    if modmap_remap:
+        block = {"name": "长按行为"}
+        if device:
+            block["device"] = {"only": [device]}
+        block["remap"] = modmap_remap
+        doc["modmap"] = [block]
+    if expmap_remap:
+        # experimental_map 不支持 device 匹配，靠服务的 --device 限定范围
+        doc["experimental_map"] = [{"name": "双击行为", "remap": expmap_remap}]
+    header = "# 由侧键映射工具生成。手改前先用 sidekeys --print 看现状。\n"
+    return header + yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
 def read_current():
-    remap = dict(DEFAULT_REMAP)
+    bindings = {k: dict(v) for k, v in DEFAULT_BINDINGS.items()}
     device = None
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError):
-        return remap, device
+        return bindings, device
+
+    def token_of(value):
+        if value is None or value == []:
+            return "[]" if value == [] else None
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value) or "[]"
+        return str(value)
+
     for block in doc.get("keymap") or []:
-        for code, _ in BUTTONS:
-            if code in (block.get("remap") or {}):
-                value = block["remap"][code]
-                remap[code] = "[]" if value in (None, [], {}) else str(value)
+        for code, target in (block.get("remap") or {}).items():
+            if code in bindings:
+                bindings[code]["tap"] = token_of(target)
         only = (block.get("device") or {}).get("only")
         if only:
             device = str(only[0])
-        elif "device" in block:
-            device = None
-    return remap, device
+    for block in doc.get("modmap") or []:
+        for code, target in (block.get("remap") or {}).items():
+            if code not in bindings or not isinstance(target, dict):
+                continue
+            if "alone" in target:
+                bindings[code]["tap"] = token_of(target["alone"])
+            if "held" in target:
+                bindings[code]["hold"] = token_of(target["held"])
+        only = (block.get("device") or {}).get("only")
+        if only and not device:
+            device = str(only[0])
+    for block in doc.get("experimental_map") or []:
+        for code, target in (block.get("remap") or {}).items():
+            if code in bindings and isinstance(target, dict) and "double" in target:
+                bindings[code]["double"] = token_of(target["double"])
+    return bindings, device
 
 
 def list_mice():
@@ -114,6 +170,20 @@ def list_mice():
         if any(tok.startswith("mouse") for tok in handlers.group(1).split()) and "Touchpad" not in name.group(1):
             names.append(name.group(1))
     return names
+
+
+def load_validator():
+    for p in VALIDATOR_PATHS:
+        if not os.path.isfile(p):
+            continue
+        ns = {"__file__": p}
+        try:
+            code = compile(open(p, encoding="utf-8").read(), p, "exec")
+            exec(code, ns)
+            return ns.get("validate"), ns.get("has_side_button_binding")
+        except Exception as exc:
+            print(f"[sidekeys] 校验器加载失败 {p}: {exc}", file=sys.stderr)
+    return None, None
 
 
 def run_in_thread(argv, callback, timeout=180):
@@ -145,9 +215,10 @@ def poll_service(callback):
 class SideKeysWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.set_default_size(560, 640)
+        self.set_default_size(580, 760)
         self.busy = False
-        remap, device = read_current()
+        self.validate_fn, self.semantic_fn = load_validator()
+        bindings, device = read_current()
 
         self.header = Adw.HeaderBar()
         self.title_widget = Adw.WindowTitle(title="侧键映射", subtitle="")
@@ -173,23 +244,24 @@ class SideKeysWindow(Adw.ApplicationWindow):
         rows_box.set_margin_bottom(24)
         rows_box.set_margin_start(12)
         rows_box.set_margin_end(12)
-        self.rows_box = rows_box
 
         self.rows = {}
         for code, cn in BUTTONS:
             group = Adw.PreferencesGroup(title=f"{cn}（{code}）")
-            combo = Adw.ComboRow(title="映射为")
-            combo.set_model(Gtk.StringList.new([label for label, _ in PRESETS]))
-            combo.set_selected(self._preset_index(remap[code]))
-            combo.connect("notify::selected", self._on_choice, code)
-            group.add(combo)
+            for kind, gn in GESTURES:
+                labels = ([NONE_LABEL] if kind in ("hold", "double") else []) + [lb for lb, _ in PRESETS]
+                combo = Adw.ComboRow(title=gn)
+                combo.set_model(Gtk.StringList.new(labels))
+                combo.set_selected(self._preset_index(labels, bindings[code].get(kind), kind))
+                combo.connect("notify::selected", self._on_choice, code, kind)
+                group.add(combo)
 
-            entry = Adw.EntryRow(title="xremap 写法，例如 C-c / A-Tab / F5 / []")
-            entry.set_text(remap[code])
-            entry.connect("changed", lambda *_: self._update_preview())
-            group.add(entry)
+                entry = Adw.EntryRow(title="xremap 写法，例如 C-c / A-Tab / Enter / []")
+                entry.set_text(bindings[code].get(kind) or "")
+                entry.connect("changed", lambda *_: self._update_preview())
+                group.add(entry)
 
-            self.rows[code] = (combo, entry)
+                self.rows[(code, kind)] = (combo, entry, labels)
             rows_box.append(group)
 
         dev_group = Adw.PreferencesGroup(title="作用范围")
@@ -200,13 +272,20 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.device_row.set_model(self.device_model)
         self.device_row.connect("notify::selected", lambda *_: self._update_preview())
         dev_group.add(self.device_row)
+        hint = Adw.PreferencesGroup()
+        hint_row = Adw.ActionRow(title="双击走 experimental_map", subtitle="上游标注为实验特性，版本更新可能改格式；xremap 不支持在 experimental_map 里做设备匹配，范围由服务的 --device 保证")
+        hint.add(hint_row)
+        warn = Adw.PreferencesGroup()
+        warn.add(Adw.ActionRow(title="回车类动作会发给当前焦点应用", subtitle="终端里是执行；在聊天框/表单里可能直接发送或提交"))
         rows_box.append(dev_group)
+        rows_box.append(hint)
+        rows_box.append(warn)
 
         adv_group = Adw.PreferencesGroup(title="将写入的 YAML", description="只读预览；点“应用”才会写入并生效")
         preview_scroll = Gtk.ScrolledWindow()
         preview_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         preview_scroll.set_propagate_natural_height(True)
-        preview_scroll.set_max_content_height(240)
+        preview_scroll.set_max_content_height(260)
         self.preview_text = Gtk.TextView(editable=False, monospace=True, cursor_visible=False)
         self.preview_text.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         preview_scroll.set_child(self.preview_text)
@@ -216,7 +295,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        clamp = Adw.Clamp(maximum_size=560)
+        clamp = Adw.Clamp(maximum_size=580)
         clamp.set_child(rows_box)
         scrolled.set_child(clamp)
 
@@ -233,28 +312,29 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.set_content(bar)
 
         self._populate_devices(device)
-        for code, _ in BUTTONS:
-            self._sync_custom_visibility(code)
+        for code, kind in [(c, k) for c, _ in BUTTONS for k, _ in GESTURES]:
+            self._sync_custom_visibility(code, kind)
         self._update_preview()
         self._refresh_status()
         GLib.timeout_add_seconds(5, self._refresh_status)
 
-    def _preset_index(self, token):
-        for idx, (label, value) in enumerate(PRESETS):
-            if value and value == token:
-                return idx
-        return len(PRESETS) - 1
+    def _preset_index(self, labels, token, kind):
+        want = token if token else (NONE_LABEL if kind in ("hold", "double") else None)
+        if want is None:
+            return labels.index(CUSTOM_LABEL)
+        if want in labels:
+            return labels.index(want)
+        return labels.index(CUSTOM_LABEL) if CUSTOM_LABEL in labels else 0
 
     def _populate_devices(self, current):
         names = list_mice()
         if current and current not in names:
             names.insert(0, current)
-        if not names:
-            names = [NO_DEVICE]
-        for name in names:
+        strings = names or [NO_DEVICE]
+        for name in strings:
             self.device_model.append(name)
-        target = current or names[0]
-        self.device_row.set_selected(names.index(target) if target in names else 0)
+        target = current if current in strings else strings[0]
+        self.device_row.set_selected(strings.index(target))
 
     def _selected_device(self):
         idx = self.device_row.get_selected()
@@ -263,34 +343,49 @@ class SideKeysWindow(Adw.ApplicationWindow):
         name = self.device_model.get_string(idx)
         return None if name == NO_DEVICE else name
 
-    def _sync_custom_visibility(self, code):
-        combo, entry = self.rows[code]
-        is_custom = combo.get_selected() == len(PRESETS) - 1
+    def _sync_custom_visibility(self, code, kind):
+        combo, entry, labels = self.rows[(code, kind)]
+        is_custom = combo.get_selected_item().get_string() == CUSTOM_LABEL
         entry.set_visible(is_custom)
         if not is_custom:
-            entry.set_text(TOKEN_BY_LABEL[combo.get_selected_item().get_string()])
+            entry.set_text("" if combo.get_selected_item().get_string() == NONE_LABEL else TOKEN_BY_LABEL[combo.get_selected_item().get_string()])
 
-    def _on_choice(self, combo, _param, code):
-        self._sync_custom_visibility(code)
+    def _on_choice(self, combo, _param, code, kind):
+        self._sync_custom_visibility(code, kind)
         self._update_preview()
 
-    def current_remap(self):
-        remap = {}
+    def current_bindings(self):
+        out = {}
         for code, _ in BUTTONS:
-            combo, entry = self.rows[code]
-            if combo.get_selected() == len(PRESETS) - 1:
-                token = entry.get_text().strip()
-            else:
-                token = TOKEN_BY_LABEL[combo.get_selected_item().get_string()]
-            remap[code] = token or "[]"
-        return remap
+            out[code] = {}
+            for kind, _gn in GESTURES:
+                combo, entry, _labels = self.rows[(code, kind)]
+                label = combo.get_selected_item().get_string()
+                if label == CUSTOM_LABEL:
+                    token = entry.get_text().strip()
+                elif label == NONE_LABEL:
+                    token = None
+                else:
+                    token = TOKEN_BY_LABEL[label]
+                out[code][kind] = token
+        return out
+
+    def _describe(self, bindings):
+        bits = []
+        for code, cn in BUTTONS:
+            parts = []
+            for kind, gn in GESTURES:
+                tok = bindings[code].get(kind)
+                if tok:
+                    parts.append(f"{gn}={LABEL_BY_TOKEN.get(tok, tok)}")
+            if parts:
+                bits.append(f"{cn} " + "/".join(parts))
+        return " ／ ".join(bits)
 
     def _update_preview(self):
-        remap = self.current_remap()
-        self.preview_text.get_buffer().set_text(dump_yaml(remap, self._selected_device()))
-        self.title_widget.set_subtitle(
-            f"后侧键 = {label_for(remap['BTN_SIDE'])} ／ 前侧键 = {label_for(remap['BTN_EXTRA'])}"
-        )
+        bindings = self.current_bindings()
+        self.preview_text.get_buffer().set_text(dump_yaml(bindings, self._selected_device()))
+        self.title_widget.set_subtitle(self._describe(bindings))
 
     def _refresh_status(self):
         poll_service(self._on_status)
@@ -301,23 +396,28 @@ class SideKeysWindow(Adw.ApplicationWindow):
         if state == "active":
             self.banner.set_revealed(False)
         else:
-            self.banner.set_title(f"xremap 未在运行（{state}，历史重启 {props.get('NRestarts', '?')} 次）")
+            self.banner.set_title(f"{UNIT} 未在运行（{state}，历史重启 {props.get('NRestarts', '?')} 次）")
             self.banner.set_button_label("启动服务")
             self.banner.set_revealed(True)
 
     def _on_apply(self, _btn):
-        remap = self.current_remap()
+        bindings = self.current_bindings()
         device = self._selected_device()
-        bad = [code for code, token in remap.items() if not VALID_TOKEN.match(token)]
+        bad = [
+            f"{code}.{kind}"
+            for code in bindings
+            for kind, tok in bindings[code].items()
+            if tok and not VALID_TOKEN.match(tok)
+        ]
         if bad:
-            self._toast(f"{', '.join(bad)} 的写法里有不被接受的字符", error=True)
+            self._toast(f"这几处写法有不被接受的字符：{', '.join(bad)}", error=True)
             return
         if not device:
             self._toast("没有可选的鼠标设备。本工具刻意只接管单个设备，不去抓全部键盘", error=True)
             return
-        payload = dump_yaml(remap, device)
-        if "BTN_SIDE" not in payload or not payload.strip():
-            self._toast("生成的配置里没有侧键映射，已中止", error=True)
+        payload = dump_yaml(bindings, device)
+        if "BTN_SIDE" not in payload and "BTN_EXTRA" not in payload:
+            self._toast("生成的配置里没有任何侧键绑定，已中止", error=True)
             return
         try:
             with open(STAGE_PATH, "w", encoding="utf-8") as fh:
@@ -328,6 +428,11 @@ class SideKeysWindow(Adw.ApplicationWindow):
         except OSError as exc:
             self._toast(f"无法写暂存文件：{exc}", error=True)
             return
+        if self.validate_fn:
+            errs = self.validate_fn(STAGE_PATH)
+            if errs:
+                self._toast("校验未通过：" + errs[0], error=True)
+                return
         self._dispatch(["apply", STAGE_PATH, device], "已生效")
 
     def _dispatch(self, args, ok_message):
@@ -352,28 +457,25 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
     def _toast(self, message, error=False):
         toast = Adw.Toast.new(message)
-        toast.set_timeout(7 if error else 4)
+        toast.set_timeout(8 if error else 4)
         toast.set_priority(Adw.ToastPriority.HIGH if error else Adw.ToastPriority.NORMAL)
         self.toast.add_toast(toast)
 
 
 def cli_mode(argv):
-    remap, device = read_current()
+    bindings, device = read_current()
     if argv[0] == "--print":
-        sys.stdout.write(dump_yaml(remap, device))
+        sys.stdout.write(dump_yaml(bindings, device))
         return 0
     if argv[0] == "--mice":
         print("\n".join(list_mice()))
         return 0
-    if argv[0] == "--render" and len(argv) >= 5:
-        sys.stdout.write(dump_yaml({"BTN_SIDE": argv[2], "BTN_EXTRA": argv[4]}, device))
-        return 0
-    print("用法: sidekeys.py [--print | --mice | --render SIDE C-c EXTRA C-v]", file=sys.stderr)
+    print("用法: sidekeys [--print | --mice]", file=sys.stderr)
     return 2
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("--print", "--mice", "--render"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("--print", "--mice"):
         return cli_mode(sys.argv[1:])
     app = Adw.Application(application_id="com.andeyunhui.sidekeys")
 

@@ -2,6 +2,34 @@
 
 遵循 Keep a Changelog / SemVer 风格。
 
+## 0.2.0 — 2026-11-07
+
+### 新增
+
+- **每个侧键支持三个手势**：点按 / 长按 / 双击，各自一行下拉，长按与双击默认“（不启用）”。
+  点按落 `keymap`；设了长按则该键改由 `modmap` 的 `alone`/`held` 表达（不再在两层重复写）；
+  双击落 `experimental_map` 的 `double` + `timeout`。
+- **宏可以直接写在界面上**：自定义输入里用逗号分隔（`C-c, Enter`），生成时转成 YAML 序列，
+  不再是字符串 `"C-c, Enter"`。
+- `src/sidekeys_validate.py`：自建的键名与语义校验器，GUI 与 root 助手共用。
+  起因是实测发现 `xremap --validate-config` **不校验 modmap 的键名**（`held: [TotallyBogus]`
+  也返回 “Config is valid”），错键名会静默失效而服务仍 active；校验器会拒写并给近似建议
+  （`Return` → `Enter`，`Side` → `BTN_SIDE`）。
+- 测试补到四个层次：`verify_validate.py`（纯逻辑 33 项）、`verify_ui.py`（控件树 26 项）、
+  `verify_apply_path.py`（应用前校验与参数，不触发授权）、`e2e_three_gestures.py`（真 apply + 撤销）。
+
+### 变更
+
+- 语义门放宽：只要 `keymap`/`modmap`/`experimental_map` **任一处**绑了侧键即通过。
+  旧的实现只认 `keymap`，会误拒“只有长按”的合法配置。
+- 预设新增“回车 / 执行”。
+
+### 已知代价
+
+- 双击依赖上游标注为 experimental 的 `experimental_map`，版本更新可能改配置格式；
+  默认 200 ms 决策窗口会给点按动作引入同量级延迟。
+- `experimental_map` 不支持 `device` 匹配，作用范围由服务的 `--device` 保证。
+
 ## 0.1.1 — 2026-11-07
 
 ### 新增

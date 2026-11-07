@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""遍历侧键映射工具的控件树，断言关键行为。需要已有 GUI 会话（X11/Wayland 均可）。"""
+"""遍历侧键映射工具的控件树，断言界面结构与联动。需要已有 GUI 会话（X11/Wayland 均可）。"""
 
 import os
 import sys
@@ -18,11 +18,11 @@ def check(name, ok, detail=""):
     results.append((name, bool(ok), detail))
 
 
-def walk(widget, depth=0):
+def walk(widget):
     yield widget
     child = widget.get_first_child()
     while child:
-        yield from walk(child, depth + 1)
+        yield from walk(child)
         child = child.get_next_sibling()
 
 
@@ -35,7 +35,7 @@ def buf_text(view):
         return buf.get_text(start, end, False)
 
 
-remap, device = sk.read_current()
+bindings, device = sk.read_current()
 app = Adw.Application(application_id="com.andeyunhui.sidekeys.test")
 win = None
 
@@ -44,56 +44,69 @@ def on_activate(application):
     global win
     win = sk.SideKeysWindow(application=application)
     win.present()
-    GLib.timeout_add(400, inspect_)
+    GLib.timeout_add(500, inspect_)
 
 
 def inspect_():
-    widgets = list(walk(win))
-    types = [type(w).__name__ for w in widgets]
-
-    check("窗口创建且进入渲染", win.get_realized() or win.get_mapped(), f"控件数={len(widgets)}")
+    widgets = list(win and walk(win) or [])
     combos = [w for w in widgets if isinstance(w, Adw.ComboRow)]
-    check("两个侧键下拉 + 一个设备下拉", len(combos) == 3, f"实际={len(combos)}")
+    entries = [w for w in widgets if isinstance(w, Adw.EntryRow)]
+
+    check("窗口创建且进入渲染", win.get_mapped() or win.get_realized(), f"控件数={len(widgets)}")
+    check("每个侧键三个手势 + 设备 = 7 个下拉", len(combos) == len(sk.BUTTONS) * len(sk.GESTURES) + 1, f"实际={len(combos)}")
+    check("每个绑定点一个自定义输入行", len(entries) == len(sk.BUTTONS) * len(sk.GESTURES), f"实际={len(entries)}")
 
     titles = [w.get_title() for w in widgets if isinstance(w, Adw.PreferencesGroup)]
-    check("分组标题齐全", all(any(code in t for t in titles) for code, _ in sk.BUTTONS), str(titles))
+    check("两个侧键分组存在", all(any(code in t for t in titles) for code, _ in sk.BUTTONS), str(titles))
+    check("手势行标题齐全", {g[1] for g in sk.GESTURES} <= {c.get_title() for c in combos})
 
-    button_rows = [c for c in combos if c.get_title() == "映射为"]
-    check(f"侧键下拉各有 {len(sk.PRESETS)} 个预设", all(c.get_model().get_n_items() == len(sk.PRESETS) for c in button_rows))
-    check("含终端里也能用的剪贴板预设", {"C-Insert", "S-Insert"} <= {v for _, v in sk.PRESETS})
-    expected = {code: sk.PRESETS.index(next(p for p in sk.PRESETS if p[1] == remap[code])) for code, _ in sk.BUTTONS}
-    got = {code: c.get_selected() for code, c in zip([c for c, _ in sk.BUTTONS], button_rows)}
-    check("下拉初始选项 = 线上配置", got == expected, f"got={got} expect={expected}")
-
-    dev_row = next(c for c in combos if c.get_title() == "鼠标设备")
-    names = [dev_row.get_model().get_string(i) for i in range(dev_row.get_model().get_n_items())]
-    check("设备列表非空", len(names) > 0, str(names))
-    check("设备列表已过滤虚拟设备 xremap", not any(n == "xremap" for n in names), str(names))
-    sel = dev_row.get_selected_item().get_string()
-    check("线上配置里的设备出现在列表中", device is None or device in names, f"device={device} names={names}")
-    check("默认选中项合法", sel in names, sel)
+    for code, cn in sk.BUTTONS:
+        for kind, gn in sk.GESTURES:
+            combo, entry, labels = win.rows[(code, kind)]
+            label = combo.get_selected_item().get_string()
+            want = bindings[code].get(kind)
+            expect = sk.NONE_LABEL if (kind in ("hold", "double") and not want) else (want or sk.CUSTOM_LABEL)
+            check(f"{cn}/{gn} 初始选项等于线上配置", label == expect or (want and label == sk.CUSTOM_LABEL),
+                  f"label={label} expect={expect}")
+            check(f"{cn}/{gn} 长按与双击默认可不启用", (kind == "tap") or (sk.NONE_LABEL in labels))
 
     preview = next(w for w in widgets if isinstance(w, Gtk.TextView))
     text = buf_text(preview)
-    check("预览 YAML 与生成器一致", text == sk.dump_yaml(remap, device), text.replace("\n", "\\n")[:80])
+    check("预览与生成器一致", text == sk.dump_yaml(bindings, device), text.replace("\n", "\\n")[:70])
     check("预览含侧键码", "BTN_SIDE" in text and "BTN_EXTRA" in text)
 
     title = next(w for w in widgets if isinstance(w, Adw.WindowTitle))
-    check("标题栏副标题显示当前映射", "复制" in title.get_subtitle(), title.get_subtitle())
+    check("标题栏副标题显示当前绑定", "点按" in title.get_subtitle(), title.get_subtitle())
 
-    # 交互：把后侧键改成“自定义…”应显示输入行，且预览随之变化
-    side_combo, side_entry = win.rows["BTN_SIDE"]
-    check("预设态下自定义输入行隐藏", not side_entry.get_visible())
-    side_combo.set_selected(len(sk.PRESETS) - 1)
-    check("选自定义后输入行可见", side_entry.get_visible())
-    side_entry.set_text("A-Tab")
+    # 交互：后侧键设双击=回车 → 预览应出现 experimental_map，且不写 device
+    combo, entry, _labels = win.rows[("BTN_SIDE", "double")]
+    combo.set_selected(_labels.index("回车 / 执行"))
     after = buf_text(preview)
-    check("自定义值进入预览", "BTN_SIDE: A-Tab" in after, after.splitlines()[-1] if after else "")
+    check("选双击后预览出现 experimental_map", "experimental_map" in after, after.replace("\n", "\\n")[:90])
+    check("experimental_map 块不含 device", "experimental_map" in after and after.split("experimental_map")[1].count("device") == 0)
 
-    # 屏蔽写法应生成空序列
-    side_combo.set_selected(next(i for i, p in enumerate(sk.PRESETS) if p[1] == "[]"))
-    blocked = buf_text(preview)
-    check("屏蔽写法生成空序列 []", "BTN_SIDE: []" in blocked, blocked.splitlines()[-1])
+    # 交互：长按=剪切 → 该键改走 modmap
+    hcombo, hentry, hlabels = win.rows[("BTN_SIDE", "hold")]
+    hcombo.set_selected(hlabels.index("剪切"))
+    after2 = buf_text(preview)
+    check("选长按后预览出现 modmap 的 alone/held", "modmap" in after2 and "held: C-x" in after2.replace("\n", " ").replace("    ", " "), after2.replace("\n", "\\n")[:120])
+
+    # 交互：自定义 → 输入行可见且进入预览；非法键名被校验器拦住
+    tcombo, tentry, tlabels = win.rows[("BTN_EXTRA", "tap")]
+    tcombo.set_selected(tlabels.index(sk.CUSTOM_LABEL))
+    check("选自定义后输入行可见", tentry.get_visible())
+    tentry.set_text("Return")
+    import tempfile
+    import sidekeys_validate as sv
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf-8") as fh:
+        fh.write(buf_text(preview))
+        tp = fh.name
+    errs = sv.validate(tp)
+    os.unlink(tp)
+    check("校验器拦下界面上的 Return", any("Enter" in x for x in errs), str(errs)[:120])
+    tentry.set_text("Enter")
+    after3 = buf_text(preview)
+    check("自定义值进入预览", "BTN_EXTRA: Enter" in after3 or "- Enter" in after3, after3.replace("\n", "\\n")[:90])
 
     app.quit()
     return False
@@ -104,6 +117,6 @@ app.run(None)
 
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  [{detail}]" if not ok and detail else ""))
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"   [{str(detail)[:110]}]" if not ok and detail else ""))
 print(f"\n{len(results) - len(failed)}/{len(results)} 通过")
 sys.exit(1 if failed else 0)

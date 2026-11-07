@@ -64,15 +64,38 @@ sudo ./uninstall.sh --purge
 
 ## 界面与用法
 
-- **两个侧键各一行**：15 项预设（复制、粘贴、剪切、复制/粘贴的终端可用变体、新开标签页、关闭标签页、
-  浏览器后退/前进、刷新、下一个/上一个窗口、锁屏、屏蔽、自定义）。选“自定义…”会出现输入行，
-  可直接写任意 xremap 写法。
-- **作用范围**：鼠标设备下拉。设备列表来自 `/proc/bus/input/devices`（**不需要任何权限**），
-  并且会过滤掉虚拟设备——包括 xremap 自己创建的输出设备，映射它会形成回环。
-- **只读 YAML 预览**：保存前你能看到将要落盘的完整内容。
-- **顶部横幅**：服务没跑时一键启动；标题栏副标题实时显示当前映射。
+每个侧键可以绑三个手势，各自一行下拉：
 
-点“应用”之后依次发生：语法校验 → 语义校验 → 备份 → 写入 → 重启 → 健康检查（失败自动回滚）。
+| 手势 | 落在哪一层 | 说明 |
+|---|---|---|
+| **点按** | `keymap`（若该键同时设了长按，则落到 `modmap` 的 `alone`） | 主功能，无额外延迟 |
+| **长按** | `modmap` 的多用途键 `alone`/`held` | 稳定特性；按住超过 `tap_timeout` 触发 held |
+| **双击** | `experimental_map` 的 `double` | 上游标注**实验特性**；默认 200 ms 决策窗口，期间第一次点击会被缓冲，所以点了双击后，点按动作会慢约 200 ms |
+
+- 长按与双击默认是“（不启用）”，所以不用它们时配置形状和 0.1.x 完全一致。
+- 预设 15 项（复制、粘贴、剪切、复制/粘贴的终端可用变体、回车/执行、新开标签页、关闭标签页、后退/前进、刷新、下一个/上一个窗口、锁屏、屏蔽、自定义）；选“自定义…”出现输入行，可写任意 xremap 写法，宏用逗号分隔（`C-c, Enter`）。
+- **设备下拉**来自 `/proc/bus/input/devices`（不需要权限），并过滤虚拟设备——包括 xremap 自己创建的输出设备，映射它会形成回环。
+- **只读 YAML 预览** + 标题栏实时摘要；服务掉线时横幅一键启动。
+
+点“应用”之后依次发生：`xremap --validate-config` → 本项目自己的键名/语义校验 → 备份 → 写入 → 重启 → 健康检查（失败自动回滚）。
+
+### 为什么要自带校验器
+
+`xremap --validate-config` 会校验 `keymap` 的键名，但**不校验 `modmap` 的键名**：实测
+`held: [TotallyBogus]` 照样返回 “Config is valid”，错键名只会在运行时静默失效，而服务仍是 active。
+所以 `src/sidekeys_validate.py` 自己解析配置，把每个 token 拆成修饰键 + 键名，用 evdev 的
+`KEY_* / BTN_*` 表加上 xremap 的别名表核对，未知名直接拒写并给近似建议——
+比如 `Return` 会提示 “你想写的可能是 Enter”（evdev 里没有 `KEY_RETURN`，只有 `KEY_ENTER`）。
+GUI 与 root 助手共用同一个校验器，界面当场拦下、助手再兜一道。
+
+### 回车类动作的风险
+
+`Enter` 是发给**当前焦点应用**的。终端里正是“执行”；但在聊天框会直接发消息、在表单里会提交、
+剪贴板是多行文本时可能执行半截命令。想“只在终端里回车”需要应用感知：本项目的服务默认
+`--desktop=none`，因此 `application:` 规则不会命中；要按应用区分，需要装
+[xremap-gnome](https://extensions.gnome.org/extension/5060/xremap/) 扩展并把 unit 改成 `--desktop=gnome`。
+
+### 终端里 Ctrl+C 不管用——这是正确的，不是 bug
 
 可用的写法（摘自 xremap 的 `doc/reference_actions.md` 与 `example/config.yml`）：
 
@@ -132,6 +155,11 @@ logind 的 `uaccess` 会把 `/dev/uinput` 的 ACL `group::` 降成 `---`，于�
 
 - **`launch` 类动作不可用**：服务跑在专用 `xremap` 用户下，它启动的进程不属于你的桌面会话。
   要支持“按键启动程序”需改用 xremap 的 socket 变体（`full` 包 + `xremap-<user>` 组 + 用户侧 bridge）。
+- **双击走实验特性**：`experimental_map` 被上游标为 experimental，“任何版本更新都可能改坏配置格式”；
+  且它默认有 200 ms 决策窗口，会给点按动作引入同样量级的延迟。长按不受此影响。
+- **`experimental_map` 不支持设备匹配**：上游文档明确该区块里没有 `device`。本项目靠服务的
+  `--device` 参数把范围锁在一个鼠标上，所以从本项目正常安装时依然是单设备作用域；
+  若你自己改 unit 去掉 `--device`，双击规则会作用到所有被抓取的设备。
 - **默认没有应用感知**：服务以 `--desktop=none` 运行，`application:` 规则不会命中。
   需要按应用区分时，见上面“办法二”（装 xremap-gnome 扩展 + `--desktop=gnome`）。
 - **不支持手柄**：xremap 本身没有 joystick/gamepad 支持（其文档中未出现相关能力），这不是 GUI 能补的。
@@ -159,19 +187,23 @@ pkexec tools/input-probe 40     # 同时看 evdev 全部事件类型与 /dev/hid
 ```
 src/sidekeys.py                     GTK4/libadwaita GUI
 src/sidekeys-apply                  pkexec 侧助手（校验/备份/写入/重启/回滚）
-data/*.desktop.in                   桌面入口模板（install.sh 替换 @BINDIR@）
+src/sidekeys_validate.py            键名与语义校验器（GUI 与助手共用，装到 /usr/local/lib/sidekeys）
+data/com.andeyunhui.sidekeys.desktop.in  桌面入口模板（install.sh 替换 @BINDIR@）
 data/org.andeyunhui.sidekeys.policy polkit 动作
 contrib/sidekeys.service            systemd 单元（改写自 xremap 文档，见署名）
 contrib/sidekeys-run                服务真实入口，替 systemd 补足引号语义
 contrib/99-sidekeys-uinput.rules    uinput 权限规则
 tools/                              输入诊断
-tests/verify_ui.py                  遍历真实控件树的结构化断言
+tests/                              自动化验证
 ```
 
-跑测试（需要一个 GUI 会话，X11 或 Wayland 都行）：
+跑测试：
 
 ```bash
-cd tests && python3 verify_ui.py
+python3 tests/verify_validate.py     # 纯逻辑：校验器不误杀/能拦住、配置生成形状、round-trip（无需 GUI）
+python3 tests/verify_ui.py           # 遍历真实控件树的结构与联动（需要 GUI 会话）
+python3 tests/verify_apply_path.py   # 应用前的校验与参数传递，不触发授权、不改线上配置
+python3 tests/e2e_three_gestures.py  # 真跑 apply 三手势 + 撤销（会弹 polkit，短暂改变你的映射）
 ```
 
 它断言：分组标题齐全、下拉初值等于线上配置、设备列表不含 xremap 的虚拟输出设备、
