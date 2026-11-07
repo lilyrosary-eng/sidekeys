@@ -66,7 +66,10 @@ def hidraw_info(path):
 
 
 def main():
-    seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    keys_only = "--keys" in flags
+    seconds = float(positional[0]) if positional else 30.0
     devices = []
     for p in evdev.list_devices():
         try:
@@ -81,7 +84,7 @@ def main():
     lock = threading.Lock()
     stop_at = time.monotonic() + seconds
 
-    print(f"窗口期 {seconds:.0f}s｜evdev 设备 {len(devices)} 个｜hidraw 节点 {len(hidraws)} 个")
+    print(f"窗口期 {seconds:.0f}s｜evdev 设备 {len(devices)} 个｜hidraw 节点 {len(hidraws)} 个" + ("｜只记按键" if keys_only else ""))
     for p in hidraws:
         vidpid, iface, name = hidraw_info(p)
         print(f"    {p}  {vidpid}  iface {iface}  {name}")
@@ -91,6 +94,8 @@ def main():
         while time.monotonic() < stop_at:
             try:
                 for ev in dev.read():
+                    if keys_only and ev.type != 1:
+                        continue
                     line = "%s evdev %-30s %s code=%-4s %-20s value=%s" % (
                         datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3],
                         dev.name[:30], type_name(ev.type), ev.code,
