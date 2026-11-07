@@ -49,6 +49,16 @@ def on_activate(application):
 
 
 def inspect_():
+    # 异常从 GLib 定时器里抛出去只会让主循环原地空转：失败必须看起来像失败，不能像卡死
+    try:
+        return _inspect_()
+    except Exception as exc:
+        check("界面检查没有抛异常", False, f"{type(exc).__name__}: {exc}")
+        app.quit()
+        return False
+
+
+def _inspect_():
     widgets = list(win and walk(win) or [])
     combos = [w for w in widgets if isinstance(w, Adw.ComboRow)]
     entries = [w for w in widgets if isinstance(w, Adw.EntryRow)]
@@ -175,6 +185,62 @@ def inspect_():
     check("切回 xremap 后自动释放开关隐藏", not win.auto_release_row.get_visible())
     check("切回 xremap 后预览回到 YAML", "keymap" in buf_text(preview) or "modmap" in buf_text(preview),
           buf_text(preview)[:70])
+
+    # 状态横幅：必须按“实际在跑的是哪个引擎”说话，而不是盯着下拉里没应用的选择
+    import subprocess
+    real = subprocess.run(["sh", "-c", sk.SERVICE_SNAPSHOT, "x", sk.XREMAP_UNIT, sk.KEYD_UNIT],
+                          capture_output=True, text=True).stdout
+    snap = sk.parse_service_lines(real)
+    check("快照能同时认出两个单元",
+          sk.XREMAP_UNIT in snap and sk.KEYD_UNIT in snap, repr(snap))
+    check("快照的实时状态与 systemctl is-active 一致",
+          snap[sk.XREMAP_UNIT]["ActiveState"] == subprocess.run(
+              ["systemctl", "is-active", sk.XREMAP_UNIT], capture_output=True, text=True
+          ).stdout.strip(), repr(snap))
+
+    def states(sel, other):
+        return {sk.XREMAP_UNIT: {"ActiveState": sel if sk.XREMAP_UNIT == win._status_unit() else other},
+                sk.KEYD_UNIT: {"ActiveState": other if sk.XREMAP_UNIT == win._status_unit() else sel},
+                "NRestarts": "0"}
+
+    def both(sel_state, other_state):
+        return {win._status_unit(): {"ActiveState": sel_state, "NRestarts": "3"},
+                win._other_unit(): {"ActiveState": other_state, "NRestarts": "0"}}
+
+    win._on_status(both("active", "inactive"))
+    check("选中后端在跑 → 横幅隐藏", not win.banner.get_revealed(), win.banner.get_title())
+
+    win._on_status(both("active", "active"))
+    check("两个引擎都在跑 → 必须喊出来（grab EBUSY 只会静默失灵）",
+          win.banner.get_revealed() and "两个引擎" in win.banner.get_title(), win.banner.get_title())
+    check("争抢时给的是“立即应用”而不是“启动服务”",
+          win.banner.get_property("action-name") == "win.apply-current",
+          str(win.banner.get_property("action-name")))
+
+    win._on_status(both("inactive", "active"))
+    check("跑的是另一个后端 → 说清楚“还没应用”",
+          win.banner.get_revealed() and "还没应用" in win.banner.get_title(), win.banner.get_title())
+    check("这种情况的按钮是立即应用", win.banner.get_property("action-name") == "win.apply-current",
+          str(win.banner.get_property("action-name")))
+
+    win._on_status(both("inactive", "inactive"))
+    check("谁都没跑 → 才是“启动服务”",
+          win.banner.get_revealed() and win.banner.get_button_label() == "启动服务",
+          win.banner.get_button_label())
+    check("“启动服务”指向 start-service 动作",
+          win.banner.get_property("action-name") == "win.start-service",
+          str(win.banner.get_property("action-name")))
+
+    # “启动服务”必须带上当前选中的后端，否则助手会去 start 已经在跑的那个（原地踏步）
+    dispatched_start = []
+    real_dispatch = win._dispatch
+    win._dispatch = lambda args, okmsg: dispatched_start.append(args)
+    win.lookup_action("start-service").activate(None)
+    check("启动服务带着后端参数",
+          dispatched_start == [["start", win.backend]], str(dispatched_start))
+    win._dispatch = real_dispatch
+    win._on_status({win._status_unit(): {"ActiveState": "unknown", "NRestarts": "?"},
+                    win._other_unit(): {"ActiveState": "unknown", "NRestarts": "?"}})
 
     # 回归：窗口被压矮时，预览框不能被挤扁（这就是线上“框非常矮”的那个 bug）
     win.set_size_request(-1, 480)

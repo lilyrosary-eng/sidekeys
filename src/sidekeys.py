@@ -579,15 +579,36 @@ def run_in_thread(argv, callback, timeout=180):
     threading.Thread(target=work, daemon=True).start()
 
 
-def poll_service(callback, unit=UNIT):
+SERVICE_SNAPSHOT = """
+for u in "$@"; do
+  printf '%s\\t%s\\t%s\\n' "$u" \\
+    "$(systemctl is-active "$u")" \\
+    "$(systemctl show "$u" -p NRestarts --value 2>/dev/null)"
+done
+true
+"""
+
+# `systemctl show a b -p ActiveState` 在本机 systemd 上不给每个块标单元名
+# （实测只打印两行 ActiveState 中间夹一个空行），所以不能靠位置归属：
+# 少装一个、被 mask 一个，块数就错位，报错报到的单元等于骗用户。
+# 这里改成每行自带单元名的快照，一次调用问两个单元。
+def parse_service_lines(text):
+    states = {}
+    for line in (text or "").splitlines():
+        cols = line.split("\t")
+        if len(cols) != 3:
+            continue
+        unit, active, restarts = cols
+        states[unit] = {"ActiveState": active, "SubState": "", "NRestarts": restarts}
+    return states
+
+
+def poll_service(callback):
     run_in_thread(
-        ["systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
-        lambda rc, out, err: callback(dict(
-            line.split("=", 1) for line in out.splitlines() if "=" in line
-        )),
+        ["sh", "-c", SERVICE_SNAPSHOT, "sidekeys-snapshot", XREMAP_UNIT, KEYD_UNIT],
+        lambda rc, out, err: callback(parse_service_lines(out)),
         timeout=10,
     )
-
 
 class SideKeysWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
@@ -614,9 +635,14 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.header.pack_end(self.apply_btn)
 
         self.banner = Adw.Banner()
+        # 每个分支会改写 action-name；start 必须带上当前选中的后端，
+        # 否则助手会去启动“正在跑的那一个”，等于原地踏步（这就是用户看到的“点了没变化”）
         start_action = Gio.SimpleAction.new("start-service", None)
-        start_action.connect("activate", lambda *_: self._dispatch(["start"], "服务已启动"))
+        start_action.connect("activate", lambda *_: self._dispatch(["start", self.backend], "服务已启动"))
         self.add_action(start_action)
+        apply_action = Gio.SimpleAction.new("apply-current", None)
+        apply_action.connect("activate", lambda *_: self._on_apply(None))
+        self.add_action(apply_action)
         self.banner.set_property("action-name", "win.start-service")
 
         # 旧窗口横幅：宁可挡在应用前面，也不要让「点应用没反应」变成猜谜
@@ -876,18 +902,43 @@ class SideKeysWindow(Adw.ApplicationWindow):
         # keyd 后端跑的是它自己的单元；报错了单元就等于在骗用户
         return KEYD_UNIT if self.backend == KEYD_BACKEND else XREMAP_UNIT
 
+    def _other_unit(self):
+        return XREMAP_UNIT if self._status_unit() == KEYD_UNIT else KEYD_UNIT
+
     def _refresh_status(self):
-        poll_service(self._on_status, self._status_unit())
+        poll_service(self._on_status)
         return True
 
-    def _on_status(self, props):
-        state = props.get("ActiveState", "unknown")
-        if state == "active":
-            self.banner.set_revealed(False)
-        else:
-            self.banner.set_title(f"{self._status_unit()} 未在运行（{state}，历史重启 {props.get('NRestarts', '?')} 次）")
-            self.banner.set_button_label("启动服务")
-            self.banner.set_revealed(True)
+    def _on_status(self, states):
+        sel, other = self._status_unit(), self._other_unit()
+        sel_state = (states.get(sel) or {}).get("ActiveState", "unknown")
+        other_state = (states.get(other) or {}).get("ActiveState", "unknown")
+        other_backend = KEYD_BACKEND if other == KEYD_UNIT else XREMAP_BACKEND
+        banner = self.banner
+        if sel_state == "active" and other_state != "active":
+            banner.set_revealed(False)
+            return
+        if sel_state == "active" and other_state == "active":
+            # 实测过这个组合的后果：grab 拿到 EBUSY 的一方只是“不选中那个设备”，
+            # 服务照样 running，侧键却完全失灵 —— 所以必须显式喊出来
+            banner.set_title(f"两个引擎同时在跑（{XREMAP_UNIT} 与 {KEYD_UNIT}）："
+                             f"被占用的一方不会报错，只会静默不接管侧键。请点“应用”让本工具强制只留一个")
+            banner.set_button_label("立即应用")
+            banner.set_property("action-name", "win.apply-current")
+            banner.set_revealed(True)
+            return
+        if other_state == "active":
+            banner.set_title(f"当前实际生效的是 {other}（{other_backend} 后端）；"
+                             f"你选了 {self.backend}，改动还没应用")
+            banner.set_button_label("立即应用")
+            banner.set_property("action-name", "win.apply-current")
+            banner.set_revealed(True)
+            return
+        banner.set_title(f"{sel} 未在运行（{sel_state}，历史重启 "
+                         f"{(states.get(sel) or {}).get('NRestarts', '?')} 次）")
+        banner.set_button_label("启动服务")
+        banner.set_property("action-name", "win.start-service")
+        banner.set_revealed(True)
 
     def _check_stale(self):
         if not self.get_visible():

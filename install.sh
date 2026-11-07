@@ -151,6 +151,13 @@ install -d -m 0755 /usr/local/lib/sidekeys
 install -m 0644 "$REPO/src/sidekeys_validate.py" /usr/local/lib/sidekeys/sidekeys_validate.py
 install -m 0644 "$REPO/data/org.andeyunhui.sidekeys.policy" /usr/share/polkit-1/actions/
 install -m 0644 "$REPO/contrib/sidekeys.service" "/etc/systemd/system/${UNIT}.service"
+# 反向也声明一次互斥：这样无论 sidekeys 与 keyd 谁先被 enable、谁先启动，
+# systemd 的事务里都不会同时出现两个引擎（我们的 unit 里已有 Conflicts=keyd.service）。
+# 注意这条的副作用：如果你还想让 keyd 顺便管键盘，就不能再走 xremap 后端 ——
+# 那两个引擎抢的是同一只鼠标，不是同一段配置。
+install -d -m 0755 /etc/systemd/system/keyd.service.d
+install -m 0644 "$REPO/contrib/10-keyd-exclusivity.conf" \
+  /etc/systemd/system/keyd.service.d/10-exclusivity.conf
 bash -n /usr/local/bin/sidekeys-apply
 bash -n /usr/local/bin/sidekeys-run
 python3 -c 'import yaml' 2>/dev/null || { echo "缺 python3-yaml（Ubuntu: apt install python3-yaml）" >&2; exit 1; }

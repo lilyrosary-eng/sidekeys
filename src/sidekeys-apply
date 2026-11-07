@@ -3,7 +3,8 @@
 #
 #   sidekeys-apply apply <暂存文件> <设备名> [xremap|keyd]   校验 → 备份 → 写入 → 只让一个引擎运行
 #   sidekeys-apply restore                                     恢复当前后端的上一版备份
-#   sidekeys-apply start | stop                                启停当前后端的单元
+#   sidekeys-apply start [xremap|keyd]                           启动指定后端（另一个显式让位）
+#   sidekeys-apply stop  [xremap|keyd]                           停止指定后端；不传参数则两个都停
 #
 # 为什么必须“只让一个引擎运行”：xremap 与 keyd 都用 EVIOCGRAB 独占同一只鼠标，
 # 两个都跑就是一个永远读不到事件（而且是静默的）。所以切后端时另一边必须 stop+disable。
@@ -163,17 +164,40 @@ case "${1:-}" in
         fi
         ;;
     start)
-        backend=$(active_backend)
-        unit=$([ "$backend" = keyd ] && echo "$KEYD_UNIT" || echo "$UNIT")
-        systemctl start "$unit"
-        wait_active "$unit" || die "启动失败：$(logs "$unit")"
-        echo "服务已启动（$unit）"
+        # 必须按界面选的后端启动，并显式让另一个让位：
+        # 旧实现是“谁在跑就 start 谁”，于是用户选了 keyd 却点了“启动服务”时
+        # 只是把已经在跑的 xremap 又 start 了一遍，横幅当然一动不动。
+        if [ -n "${2:-}" ]; then
+            backend=$(backend_of_arg "$2")
+        else
+            backend=$(active_backend)
+        fi
+        if [ "$backend" = keyd ]; then
+            [ -s "$KEYD_CONF" ] || die "$KEYD_CONF 不存在或为空：请在界面里选 keyd 后端后点“应用”"
+            systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+            systemctl enable --now "$KEYD_UNIT"
+            wait_active "$KEYD_UNIT" || die "启动失败：$(logs "$KEYD_UNIT")"
+            echo "服务已启动（$KEYD_UNIT；$UNIT 已停用，避免两个引擎抢同一只鼠标）"
+        else
+            [ -s "$CONF" ] || die "$CONF 不存在或为空：请在界面里点“应用”写入配置"
+            systemctl disable --now "$KEYD_UNIT" >/dev/null 2>&1 || true
+            systemctl enable --now "$UNIT"
+            wait_active "$UNIT" || die "启动失败：$(logs "$UNIT")"
+            echo "服务已启动（$UNIT；$KEYD_UNIT 已停用）"
+        fi
         ;;
     stop)
-        for unit in "$UNIT" "$KEYD_UNIT"; do
+        if [ -n "${2:-}" ]; then
+            backend=$(backend_of_arg "$2")
+            unit=$([ "$backend" = keyd ] && echo "$KEYD_UNIT" || echo "$UNIT")
             systemctl stop "$unit" 2>/dev/null || true
-        done
-        echo "两个后端的单元都已停止（侧键恢复鼠标默认行为）"
+            echo "已停止 $unit（另一个后端本来就没跑；侧键恢复鼠标默认行为）"
+        else
+            for unit in "$UNIT" "$KEYD_UNIT"; do
+                systemctl stop "$unit" 2>/dev/null || true
+            done
+            echo "两个后端的单元都已停止（侧键恢复鼠标默认行为）"
+        fi
         ;;
     *)
         die "未知子命令：${1:-}（可用：apply / restore / start / stop）"

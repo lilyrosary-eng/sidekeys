@@ -13,6 +13,33 @@
   收集完数据后崩掉，自动退到 `/tmp/input-probe-<uid>.log` 并在终端提示。
 - 窗口期开场白不再自带“每个键按 2 次”的节奏指示——它会覆盖调用方自己印的按键表。
 
+## 0.3.1 — 2026-11-07
+
+### 修复（0.3.0 的后端切换有两个真窟窿，都是用户实测发现的）
+
+- **「启动服务」不再原地踏步**：横幅按钮过去不带后端参数，助手按“谁在跑就 start 谁”办事，
+  于是选了 keyd 之后点它只是把已经在跑的 xremap 又 start 一遍，横幅文字一模一样。
+  现在 `start`/`stop` 接受显式后端，并且启动一方时**显式 disable --now 另一方**。
+- **状态横幅改为按“实际在跑的是哪个引擎”说话**，分四种情况：
+  ① 选中的在跑 → 隐藏；② 两个都在跑 → 明确警告（实测 `device.grab()` 遇到 EBUSY 只是
+  “不选中这个设备”，服务照样 running、侧键完全失灵，不会报错）；
+  ③ 跑的是另一个后端 → 说“你选了 X 还没应用”，按钮改成「立即应用」；
+  ④ 谁都没跑 → 才是「启动服务」。
+  过去它只盯着下拉里那个选择，所以出现“明明在跑却报未运行、点启动又什么都没发生”。
+- **服务快照改为带单元名的输出**：`systemctl show sidekeys keyd -p ActiveState` 在本机
+  systemd 上不打印单元名（实测只输出两行 ActiveState 夹一个空行），按位置归属会在
+  “少装一个/被 mask 一个”时错位报错。现在每行自带单元名与 NRestarts，一次调用问两个单元。
+- **“只跑一个引擎”改成由 systemd 保证**：`contrib/sidekeys.service` 里加
+  `Conflicts=keyd.service` + `Before=keyd.service`，`install.sh` 同时给 keyd 装一份
+  `/etc/systemd/system/keyd.service.d/10-exclusivity.conf`（反向也声明）。
+  之前只靠 apply 脚本里的 `disable --now`，堵不住“两个 unit 都被 enable、开机看谁先起”的情况。
+  副作用写进 README：如果你还想让 keyd 顺便管键盘，就不能同时用 xremap 后端。
+  `uninstall.sh` 会清掉这份 drop-in。
+
+- 测试基建：`verify_ui` 的定时器回调里抛异常会让 GLib 主循环原地空转，
+  表现为“测试卡死”而不是失败；现在异常会被记录并退出。`Gio.Action.activate()` 是两参数，
+  之前多传了一个 platform_data。
+
 ## 0.3.0 — 2026-11-07
 
 ### 新增

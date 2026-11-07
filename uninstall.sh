@@ -55,6 +55,8 @@ if [ -f /etc/keyd/sidekeys.conf ]; then
   echo "已移除本工具写入的 /etc/keyd/sidekeys.conf 并停止 keyd；侧键恢复鼠标默认行为"
 fi
 rm -f "/etc/systemd/system/${UNIT}.service"
+rm -f /etc/systemd/system/keyd.service.d/10-exclusivity.conf
+rmdir /etc/systemd/system/keyd.service.d 2>/dev/null || true
 rm -f /usr/local/bin/sidekeys-apply
 rm -f /usr/local/bin/sidekeys-run
 rm -rf /usr/local/lib/sidekeys

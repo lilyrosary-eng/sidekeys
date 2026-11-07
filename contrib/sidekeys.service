@@ -2,6 +2,11 @@
 Description=sidekeys (xremap-powered mouse side-button remapping)
 Documentation=https://github.com/lilyrosary-eng/sidekeys
 After=default.target
+# 与 keyd 互斥：两者都靠 EVIOCGRAB 独占同一只鼠标，而 grab 撞上 EBUSY 的一方
+# 不报错退出、只是不接管设备（xremap src/device.rs），于是服务照样 running、侧键静默失灵。
+# 交给 systemd 保证事务里同时只有一个，而不是只靠脚本里那些 disable --now。
+Conflicts=keyd.service
+Before=keyd.service
 
 [Service]
 # 实际入口是 wrapper：systemd 会把展开后的变量按空白拆成多个参数，而设备名里几乎总带空格，

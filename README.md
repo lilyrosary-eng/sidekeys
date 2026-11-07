@@ -109,6 +109,11 @@ sudo ./uninstall.sh --purge
 唯一靠 repeat 事件，而鼠标按键不发 repeat（上游在 `event_handler.rs` 里就是这么注释的），
 `Event::Tick` 计时器又被 event handler 显式忽略。所以这不是配置问题，是它的结构。
 
+**互斥是由 systemd 保证的**：我们的 unit 写了 `Conflicts=keyd.service`，`install.sh` 也会给
+keyd 装一份反向 drop-in。原因是 `device.grab()` 撞上 EBUSY 时，xremap 不报错退出，只是“不选中这个
+设备”（`src/device.rs`）—— 服务照样 `running`，侧键却完全失灵，是最难查的一种失败。
+副作用：如果你想让 keyd 顺便管键盘，就不要再切回 xremap 后端，两个引擎抢的是同一只鼠标。
+
 选 keyd 时值得同时打开「长按自动释放」：长按动作直接绑 `enter` 会在按住期间被内核重复
 （实测 251ms 首发、之后每约 34ms 一次 —— 按住 1 秒 ≈ 24 个回车）；
 打开后本工具把它包成 `macro2(0, 0, enter)`，只发一次（man：timeout 取 0 即关闭宏重复）。
