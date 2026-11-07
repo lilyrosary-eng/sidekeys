@@ -23,10 +23,15 @@ from gi.repository import Adw, Gio, GLib, Gtk
 
 CONFIG_PATH = "/etc/xremap/config.yml"
 STAGE_PATH = f"/tmp/sidekeys-stage-{os.getuid()}.yml"
-APPLY_HELPER = "/usr/local/bin/sidekeys-apply"
+# 规范路径按 Debian 约定放在 /usr/lib/sidekeys（包不能往 /usr/local 写东西）；
+# /usr/local 那一组是旧版 install.sh 留下的位置，只作兼容回退：
+# 老机器上的 polkit 策略里 exec.path 指的正是旧路径，回退能让“GUI 已升级、root 侧还没跑”
+# 这段窗口期仍然可用，而不是莫名被授权拒绝。
+APPLY_HELPER_CANDIDATES = ("/usr/lib/sidekeys/sidekeys-apply", "/usr/local/bin/sidekeys-apply")
 # 先找与 GUI 同目录的那一份：规则必须和生成器同版本，
 # 否则旧的系统校验器会把新版合法写法（例如 tap_timeout_millis）判成未知键。
 VALIDATOR_PATHS = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidekeys_validate.py"),
+                   "/usr/lib/sidekeys/sidekeys_validate.py",
                    "/usr/local/lib/sidekeys/sidekeys_validate.py")
 UNIT = "sidekeys"
 XREMAP_UNIT = "sidekeys"       # 我们自己的 xremap 服务单元
@@ -395,6 +400,11 @@ def dump_yaml(bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT):
     return header + yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
+# 测试用注入点：这台机器可能正跑着 keyd，而用例要验证的是 xremap 分支，
+# 只能显式指定后端，否则 read_current 会去读线上的 keyd 配置、用例集体跑偏。
+BACKEND_OVERRIDE = None
+
+
 def service_active(unit):
     try:
         proc = subprocess.run(["systemctl", "is-active", "--quiet", unit], timeout=5)
@@ -416,7 +426,7 @@ def detect_backend():
 
 def read_current():
     """返回 (绑定, 设备名, 长按阈值, 后端, 长按自动释放)。"""
-    backend = detect_backend()
+    backend = BACKEND_OVERRIDE or detect_backend()
     if backend == KEYD_BACKEND:
         try:
             with open(KEYD_CONFIG_PATH, encoding="utf-8") as fh:
@@ -526,7 +536,7 @@ def helper_supports_keyd():
     读不到文件时保守返回 True（让助手自己判），读到但没有分支就明确拒绝。
     """
     try:
-        with open(APPLY_HELPER, encoding="utf-8", errors="replace") as fh:
+        with open(apply_helper(), encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except OSError:
         return True
@@ -545,6 +555,18 @@ def load_validator():
         except Exception as exc:
             print(f"[sidekeys] 校验器加载失败 {p}: {exc}", file=sys.stderr)
     return None, None
+
+
+def apply_helper():
+    """第一个真实存在的 root 助手路径。
+
+    两条安装路线（deb 与 install.sh）的先后顺序不可预知，GUI 必须跟着文件走
+    而不是跟着常量走：指向一个不存在的脚本时，polkit 只会给一句难懂的授权失败。
+    """
+    for path in APPLY_HELPER_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return APPLY_HELPER_CANDIDATES[0]
 
 
 def self_fingerprint():
@@ -975,7 +997,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
             self._toast("没有可选的鼠标设备。本工具刻意只接管单个设备，不去抓全部键盘", error=True)
             return
         if self.backend == KEYD_BACKEND and not helper_supports_keyd():
-            self._toast(f"{APPLY_HELPER} 还是旧版，不认识 keyd 后端；请重跑 sudo ./install.sh 更新 root 侧",
+            self._toast(f"{apply_helper()} 还是旧版，不认识 keyd 后端；请重装（deb 或 sudo ./install.sh）",
                         error=True)
             return
         try:
@@ -1011,7 +1033,8 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.busy = True
         self.apply_btn.set_sensitive(False)
         self.undo_btn.set_sensitive(False)
-        run_in_thread(["pkexec", APPLY_HELPER] + args, lambda rc, out, err: self._done(rc, out, err, ok_message))
+        run_in_thread(["pkexec", apply_helper()] + args,
+                      lambda rc, out, err: self._done(rc, out, err, ok_message))
 
     def _done(self, rc, out, err, ok_message):
         self.busy = False

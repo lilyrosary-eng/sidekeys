@@ -132,6 +132,18 @@ def run_case(a):
     a.quit()
 
 
+# 路径漂移检查：deb 与 install.sh 都按规范路径找助手，顺序不能反。
+results.append(("助手候选首位是规范路径",
+                sk.APPLY_HELPER_CANDIDATES[0] == "/usr/lib/sidekeys/sidekeys-apply",
+                str(sk.APPLY_HELPER_CANDIDATES)))
+results.append(("校验器候选含规范路径",
+                "/usr/lib/sidekeys/sidekeys_validate.py" in sk.VALIDATOR_PATHS,
+                str(sk.VALIDATOR_PATHS)))
+results.append(("apply_helper 只会在真实存在时选中它",
+                sk.apply_helper() in [c for c in sk.APPLY_HELPER_CANDIDATES if os.path.isfile(c)]
+                or sk.apply_helper() == sk.APPLY_HELPER_CANDIDATES[0],
+                sk.apply_helper()))
+
 app.connect("activate", activate)
 app.run(None)
 

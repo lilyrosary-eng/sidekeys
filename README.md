@@ -38,10 +38,23 @@
 
 | 需要 | 用途 |
 |---|---|
-| `xremap` 二进制（放到 `/usr/bin/xremap`） | 实际的重映射引擎。**本仓库不打包它**，许可归 xremap 贡献者（MIT） |
-| GTK 4 + libadwaita + `python3-gi` + `python3-yaml` | GUI |
+| `keyd` (>= 2.5.0，apt 里有) | **默认后端**：长按到点即发。deb 把它列为 Recommends，装上就能用 |
+| `xremap` 二进制（放到 `/usr/bin/xremap`） | 可选后端：需要“双击手势”或以后要做应用感知时才有理由装。**本仓库不打包它**（MIT，许可归 xremap 贡献者） |
+| GTK 4 + libadwaita + `python3-gi` + `python3-yaml` + `gir1.2-adw-1` | GUI |
+| `python3-evdev`（BSD-3） | 校验器的键名白名单来源（缺了会退化成只查结构）；`tools/` 的诊断脚本也依赖它 |
 | `acl`（`setfacl`）、`polkit`、`systemd` | root 侧助手与提权 |
-| `python3-evdev`（BSD-3） | 仅 `tools/` 里的两个诊断脚本需要 |
+
+**安装位置的规范**（deb 与 `install.sh` 现在一致）：
+
+| 文件 | 位置 |
+|---|---|
+| GUI | `/usr/bin/sidekeys`（脚本安装：`~/.local/bin/sidekeys`） |
+| root 助手 / 服务 wrapper / 校验器 | `/usr/lib/sidekeys/{sidekeys-apply, sidekeys-run, sidekeys_validate.py}` |
+| 单元与 keyd 互斥 drop-in | `/usr/lib/systemd/system/…`（脚本安装放 `/etc/systemd/system/…`，优先级更高） |
+| polkit 策略 | `/usr/share/polkit-1/actions/org.andeyunhui.sidekeys.policy`，`exec.path` 指向上面那个助手 |
+
+GUI 会按候选顺序挑第一个**真实存在**的助手路径，因此从旧版（`/usr/local/bin`）升级时
+不会突然变成“未授权”；旧文件由 `install.sh` 改名留底成 `*.pre-lib-backup`，不是直接删。
 
 发行版安装 xremap 的例子（Ubuntu 26.04 的 apt 源里没有 xremap）：
 
@@ -53,14 +66,32 @@ cd /tmp && unzip -o xremap.zip && sudo install -m 0755 xremap /usr/bin/xremap
 
 ## 安装 / 卸载
 
+**方式一：deb（推荐，开箱即用）**
+
 ```bash
-sudo ./install.sh          # 服务 + GUI（幂等，不会覆盖你已有的 /etc/xremap/config.yml）
+./build_deb.sh                                     # 产出 dist/sidekeys_<版本>_amd64.deb
+sudo apt install ./dist/sidekeys_<版本>_amd64.deb   # 依赖会被 apt 自动补齐
+```
+
+包内包含 GUI、root 助手、polkit 策略、systemd 单元、udev 规则与 keyd 互斥 drop-in。
+`postinst` 的取舍是刻意的：**只要检测到 keyd 正在接管侧键，就不启动 xremap**，
+避免两个引擎抢同一只鼠标（那种情况下被 EBUSY 挡住的一方不报错，只是静默不干活）。
+
+**方式二：脚本安装**
+
+```bash
+sudo ./install.sh          # 服务 + GUI（幂等，不会覆盖你已有的配置）
 ./install.sh --user-only   # 只装 GUI，先看看界面
 sudo ./uninstall.sh        # 卸系统侧，保留配置
 sudo ./uninstall.sh --purge
 ```
 
-装完在应用列表里能看到“侧键映射 / Side Buttons”，或终端直接跑 `~/.local/bin/sidekeys`。
+> 已经装了 deb 的机器**不要再跑 `uninstall.sh`**：它会先 `dpkg -S` 判断，
+> 发现文件属于包就提示你改用 `sudo apt remove sidekeys`（手删会留下半个包）。
+> 反过来，脚本版残留的 `/etc/systemd/system/sidekeys.service` 会盖住包里的单元，
+> `postinst` 会明确打印这件事并给出一条挪走它的命令。
+
+装完在应用列表里能看到“侧键映射 / Side Buttons”，或终端直接跑 `sidekeys`（deb）/ `~/.local/bin/sidekeys`（脚本）。
 
 ## 界面与用法
 

@@ -57,12 +57,27 @@ fi
 rm -f "/etc/systemd/system/${UNIT}.service"
 rm -f /etc/systemd/system/keyd.service.d/10-exclusivity.conf
 rmdir /etc/systemd/system/keyd.service.d 2>/dev/null || true
-rm -f /usr/local/bin/sidekeys-apply
-rm -f /usr/local/bin/sidekeys-run
+# 装成 deb 的时候这些文件属于 dpkg，手删会留下半个包：交给 apt remove 处理。
+if dpkg -S /usr/lib/sidekeys/sidekeys-apply >/dev/null 2>&1; then
+  echo "   检测到 sidekeys 是以 deb 安装的，请改用：sudo apt remove sidekeys"
+else
+  rm -f /usr/lib/sidekeys/sidekeys-apply /usr/lib/sidekeys/sidekeys-run \
+        /usr/lib/sidekeys/sidekeys_validate.py
+  rmdir /usr/lib/sidekeys 2>/dev/null || true
+  rm -f /usr/local/bin/sidekeys-apply /usr/local/bin/sidekeys-run
+  rm -f /usr/local/lib/sidekeys/sidekeys_validate.py
+  rmdir /usr/local/lib/sidekeys 2>/dev/null || true
+fi
 rm -rf /usr/local/lib/sidekeys
 rm -f /usr/share/polkit-1/actions/org.andeyunhui.sidekeys.policy
 rm -f /etc/udev/rules.d/99-sidekeys-uinput.rules
-rm -f /etc/modules-load.d/uinput.conf
+# 旧版可能把 uinput 写进过 /etc/modules-load.d/uinput.conf；那文件也可能属于别的包，
+# 只有内容确实只有我们那一行时才删。
+legacy_ml=/etc/modules-load.d/uinput.conf
+if [ -f "$legacy_ml" ] && grep -qx uinput "$legacy_ml" && [ "$(grep -cv '^\s*$' "$legacy_ml")" = 1 ]; then
+  rm -f "$legacy_ml"
+fi
+rm -f /etc/modules-load.d/sidekeys-uinput.conf
 systemctl daemon-reload
 udevadm control --reload-rules
 echo "   已移除服务、助手、polkit 策略与 udev 规则"

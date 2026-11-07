@@ -13,6 +13,39 @@
   收集完数据后崩掉，自动退到 `/tmp/input-probe-<uid>.log` 并在终端提示。
 - 窗口期开场白不再自带“每个键按 2 次”的节奏指示——它会覆盖调用方自己印的按键表。
 
+## 0.4.0 — 2026-11-07
+
+### 新增
+
+- **`build_deb.sh`：开箱即用的 .deb**。用 `dpkg-deb --build --root-owner-group` 直接组树，
+  不需要 debhelper（`dh` 在 Ubuntu 上不是默装包）。产物 `dist/sidekeys_<版本>_amd64.deb`，
+  内含 GUI、root 助手、polkit 策略、systemd 单元、udev 规则、modules-load、
+  keyd 互斥 drop-in、桌面入口与文档/许可。版本号默认取 CHANGELOG 最新的数字标题。
+- 构建过程自带**四项硬自检**，都是打包真正会错的地方：
+  ① polkit 的 `exec.path` 必须是包内真实存在的文件；
+  ② 单元的 `ExecStart` 必须是规范路径且文件在包里；
+  ③ 导入包内那份 GUI 读它自己算出来的助手候选（不是在 shell 里比字符串）；
+  ④ 全部条目属主 `root/root`、无组/其他可写位、无 `__pycache__`/`.pyc`。
+
+### 变更
+
+- **root 侧路径统一到 Debian 规范位置** `/usr/lib/sidekeys/{sidekeys-apply, sidekeys-run,
+  sidekeys_validate.py}`，GUI 装到 `/usr/bin/sidekeys`；包不再往 `/usr/local` 写东西。
+  polkit 策略的 `exec.path` 与单元的 `ExecStart` 同步改掉。
+- GUI 不再写死助手路径：`APPLY_HELPER_CANDIDATES = (/usr/lib/sidekeys/…, /usr/local/bin/…)`
+  按“第一个真实存在的”来选。旧安装升级上来的机器在重跑 install.sh 之前也能继续用，
+  否则会看到一句很难懂的 polkit 授权失败。
+- `install.sh` 把旧的 `/usr/local/bin/sidekeys-apply`、`/usr/local/bin/sidekeys-run`、
+  `/usr/local/lib/sidekeys/sidekeys_validate.py` **改名留底**（`.pre-lib-backup`）而不是删除；
+  `/etc/modules-load.d/uinput.conf` 换成我们自己的 `sidekeys-uinput.conf`，不再覆盖可能属于别的包的文件。
+- `uninstall.sh` 先用 `dpkg -S` 判断：文件属于 deb 就提示改用 `sudo apt remove sidekeys`。
+
+### 说明
+
+- 构建脚本自身踩到并修掉的三个坑，都写进了注释：`import` 会往构建树写 `__pycache__`
+  并被打进包（现在 `PYTHONDONTWRITEBYTECODE=1` + 打包前清理）；目录继承工作区得到 0775；
+  `dpkg-deb -c` 的列序是 mode、uid/gid、大小，别拿错列，权限位判断要数到第 6 与第 9 位。
+
 ## 0.3.2 — 2026-11-07
 
 ### 修复（install.sh 在第 4 步就退出，root 侧根本没被更新）

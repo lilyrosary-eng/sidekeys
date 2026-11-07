@@ -1,0 +1,18 @@
+#!/bin/sh
+# prerm：停服务只在“它正在跑”时做；升级时要停，好让新单元文件生效。
+set -eu
+
+case "${1:-}" in
+  remove|upgrade|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      if systemctl is-active --quiet sidekeys; then
+        systemctl stop sidekeys || true
+      fi
+      # 绝不在这里停 keyd：keyd 是别人的包，可能在管用户的键盘。
+      # 本包被移除后，我们给 keyd 装的 drop-in 也会随之消失，Conflicts 自然失效。
+    fi
+    ;;
+esac
+
+exit 0
+

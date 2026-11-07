@@ -1,0 +1,46 @@
+#!/bin/sh
+# postinst：只做“让系统认得这份新文件”的事，绝不擅自抢走用户正在用的引擎。
+set -eu
+
+have_systemd() { [ -d /run/systemd/system ]; }
+
+case "${1:-}" in
+  configure)
+    if have_systemd; then
+      systemctl daemon-reload || true
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+      # 只重载规则，不 trigger：trigger 会重新广播所有设备，波及无关驱动
+      udevadm control --reload-rules || true
+    fi
+
+    # 脚本版 install.sh 会把同名单元装到 /etc/systemd/system，那里优先级高于包里的 /usr/lib。
+    # 这不是错误，但会让“我装了 deb 为什么 unit 没变”变得很难查，所以显式说明。
+    if [ -e /etc/systemd/system/sidekeys.service ]; then
+      echo "注意：/etc/systemd/system/sidekeys.service 已存在（多半来自 install.sh），它会盖住本包的单元文件。" >&2
+      echo "      要让本包完全接管：sudo mv /etc/systemd/system/sidekeys.service{,.pre-deb} && sudo systemctl daemon-reload" >&2
+    fi
+
+    if have_systemd; then
+      if systemctl is-active --quiet keyd; then
+        echo "检测到 keyd 正在接管侧键：本包不启动 sidekeys。" >&2
+        echo "  两个引擎都用 EVIOCGRAB 独占同一只鼠标，同时跑只有一个能收到事件且不会报错。" >&2
+        echo "  要换到 xremap 后端：sudo systemctl stop keyd && sudo systemctl start sidekeys" >&2
+      else
+        systemctl enable sidekeys >/dev/null 2>&1 || true
+        # enable 是安全默认（Debian 靠 preset 决定要不要自动起）；start 只在确实有可加载的
+        # 配置时做，否则新装的 xremap 会对着空文件反复重启。
+        # 两个配置文件都要看：只有 /etc/keyd/sidekeys.conf 说明用户选的是 keyd 后端，
+        # 而 keyd 此刻并不在跑（上面那个 is-active 分支没接住），那就该把它起起来 ——
+        # 否则会留下“侧键谁都不管”的空档。
+        if [ -s /etc/xremap/config.yml ]; then
+          systemctl --no-block start sidekeys || true
+        elif [ -s /etc/keyd/sidekeys.conf ]; then
+          systemctl --no-block start keyd || true
+        fi
+      fi
+    fi
+    ;;
+esac
+
+exit 0

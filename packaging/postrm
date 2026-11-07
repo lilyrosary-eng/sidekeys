@@ -1,0 +1,24 @@
+#!/bin/sh
+# postrm：卸载后让 systemd/udev 忘掉本包的文件；不碰用户的映射配置。
+set -eu
+
+case "${1:-}" in
+  remove|disappear)
+    if [ -d /run/systemd/system ]; then
+      systemctl disable sidekeys >/dev/null 2>&1 || true
+      systemctl daemon-reload || true
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm control --reload-rules || true
+    fi
+    ;;
+  purge)
+    # 故意不删 /etc/xremap/config.yml 与 /etc/keyd/sidekeys.conf：
+    # 那两个文件里可能还有不属于本工具的映射，删掉就是破坏用户数据。
+    echo "purge：保留 /etc/xremap/config.yml 与 /etc/keyd/sidekeys.conf（可能含你自己的映射）" >&2
+    echo "       确认要清空：sudo rm -f /etc/xremap/config.yml /etc/keyd/sidekeys.conf" >&2
+    ;;
+esac
+
+exit 0
+

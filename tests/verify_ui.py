@@ -35,6 +35,9 @@ def buf_text(view):
         return buf.get_text(start, end, False)
 
 
+# 线上可能正跑着 keyd；本套件断言的是 xremap 分支的界面形状，显式钉住后端，
+# keyd 的联动在下面通过下拉切换来测。
+sk.BACKEND_OVERRIDE = sk.XREMAP_BACKEND
 bindings, device, hold_timeout, backend, auto_release = sk.read_current()
 hold_ms = hold_timeout if isinstance(hold_timeout, int) else sk.HOLD_TIMEOUT_DEFAULT
 app = Adw.Application(application_id="com.andeyunhui.sidekeys.test")

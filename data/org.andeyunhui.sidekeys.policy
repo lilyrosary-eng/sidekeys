@@ -17,7 +17,9 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/sidekeys-apply</annotate>
+    <!-- 规范路径由 deb 与新 install.sh 共用；旧版 install.sh 装在 /usr/local/bin，
+         GUI 会自动回退到那条路径，并用它自己那份策略文件授权，两条路都能走通。 -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/sidekeys/sidekeys-apply</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

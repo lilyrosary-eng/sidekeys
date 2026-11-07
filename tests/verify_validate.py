@@ -147,10 +147,12 @@ with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf
     fh.write(text)
     p = fh.name
 old, sk.CONFIG_PATH = sk.CONFIG_PATH, p
+old_be = sk.BACKEND_OVERRIDE
+sk.BACKEND_OVERRIDE = sk.XREMAP_BACKEND
 try:
     got, dev, ht, backend, ar = sk.read_current()
 finally:
-    sk.CONFIG_PATH = old
+    sk.CONFIG_PATH, sk.BACKEND_OVERRIDE = old, old_be
 os.unlink(p)
 check("round-trip 长按阈值", ht == 400, str(ht))
 check("round-trip 点按", got["BTN_SIDE"]["tap"] == "C-c", str(got))
@@ -248,12 +250,12 @@ LEGACY = """keymap:
 with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf-8") as fh:
     fh.write(LEGACY)
     legacy_path = fh.name
-old_cfg = sk.CONFIG_PATH
-sk.CONFIG_PATH = legacy_path
+old_cfg, old_be = sk.CONFIG_PATH, sk.BACKEND_OVERRIDE
+sk.CONFIG_PATH, sk.BACKEND_OVERRIDE = legacy_path, sk.XREMAP_BACKEND
 try:
     b_legacy, d_legacy, ht_legacy, be_legacy, ar_legacy = sk.read_current()
 finally:
-    sk.CONFIG_PATH = old_cfg
+    sk.CONFIG_PATH, sk.BACKEND_OVERRIDE = old_cfg, old_be
 os.unlink(legacy_path)
 check("旧配置读回阈值为 None", ht_legacy is None, str(ht_legacy))
 out_legacy = sk.dump_config(be_legacy, b_legacy, d_legacy, ht_legacy, ar_legacy)
@@ -265,6 +267,26 @@ hold_legacy = sk.dump_config(sk.XREMAP_BACKEND,
                              "Test Mouse", None, True)
 check("有长按时 None 阈值补成默认而不是报错",
       f"tap_timeout_millis: {sk.HOLD_TIMEOUT_DEFAULT}" in hold_legacy, hold_legacy.replace("\n", "\\n")[-90:])
+
+# ---------- 7) keyd 分支经 read_current 的完整读回（含后端识别） ----------
+KEYD_LIVE = sk.dump_keyd({"BTN_SIDE": {"tap": "C-Insert", "hold": "Enter", "double": None},
+                          "BTN_EXTRA": {"tap": "S-Insert", "hold": None, "double": None}},
+                         "3151:3022", 350, True)
+with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False, encoding="utf-8") as fh:
+    fh.write(KEYD_LIVE)
+    keyd_path = fh.name
+old_keyd, old_be2 = sk.KEYD_CONFIG_PATH, sk.BACKEND_OVERRIDE
+sk.KEYD_CONFIG_PATH, sk.BACKEND_OVERRIDE = keyd_path, sk.KEYD_BACKEND
+try:
+    kb, kd, kms, kbe, kar = sk.read_current()
+finally:
+    sk.KEYD_CONFIG_PATH, sk.BACKEND_OVERRIDE = old_keyd, old_be2
+os.unlink(keyd_path)
+check("keyd 配置经 read_current 认出后端", kbe == sk.KEYD_BACKEND, str(kbe))
+check("keyd 配置读回设备名（vid:pid 反查）", kd == "YICHIP Wireless Device Mouse" or kd == "3151:3022", str(kd))
+check("keyd 配置读回阈值", kms == 350, str(kms))
+check("keyd 配置读回自动释放", kar is True, str(kar))
+check("keyd 配置读回绑定", kb["BTN_SIDE"] == {"tap": "C-Insert", "hold": "Enter", "double": None}, str(kb))
 
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:

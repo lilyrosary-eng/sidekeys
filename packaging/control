@@ -1,0 +1,20 @@
+Package: SIDEKEYS_PACKAGE
+Version: SIDEKEYS_VERSION
+Architecture: amd64
+Maintainer: lilyrosary-eng <291292024+lilyrosary-eng@users.noreply.github.com>
+Homepage: https://github.com/lilyrosary-eng/sidekeys
+Standards-Version: 4.7.0
+Section: utils
+Priority: optional
+Depends: python3 (>= 3.10), python3-gi, python3-yaml, python3-evdev, gir1.2-gtk-4.0, gir1.2-adw-1, polkitd
+Recommends: keyd (>= 2.5.0)
+Suggests: xremap
+Description: GUI remapper for the two mouse side buttons
+ A small GTK4/libadwaita front end that writes side-button mappings for a single
+ mouse device and applies them through one privileged helper behind polkit.
+ It supports two back ends: keyd (long-press fires while the button is still held)
+ and xremap (supports a double-tap gesture). Exactly one back end runs at a time,
+ because both grab the device exclusively with EVIOCGRAB.
+ .
+ The GUI never polls devices and never blocks its main thread; applying is a
+ single validated, backed-up, auto-rolled-back transaction.

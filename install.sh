@@ -150,17 +150,26 @@ else
 fi
 
 install -m 0644 "$REPO/contrib/99-sidekeys-uinput.rules" /etc/udev/rules.d/
-echo uinput > /etc/modules-load.d/uinput.conf
+# 只在自己的文件里声明，绝不覆盖可能属于其他包的 /etc/modules-load.d/uinput.conf
+echo uinput > /etc/modules-load.d/sidekeys-uinput.conf
 modprobe uinput 2>/dev/null || true
 udevadm control --reload-rules
 udevadm trigger --action=change --sysname-match=uinput || true
 
 echo
 echo "== 5. 助手、校验器、polkit 策略与 systemd 服务 =="
-install -m 0755 "$REPO/src/sidekeys-apply" /usr/local/bin/sidekeys-apply
-install -m 0755 "$REPO/contrib/sidekeys-run" /usr/local/bin/sidekeys-run
-install -d -m 0755 /usr/local/lib/sidekeys
-install -m 0644 "$REPO/src/sidekeys_validate.py" /usr/local/lib/sidekeys/sidekeys_validate.py
+install -d -m 0755 /usr/lib/sidekeys
+install -m 0755 "$REPO/src/sidekeys-apply" /usr/lib/sidekeys/sidekeys-apply
+install -m 0755 "$REPO/contrib/sidekeys-run" /usr/lib/sidekeys/sidekeys-run
+install -m 0644 "$REPO/src/sidekeys_validate.py" /usr/lib/sidekeys/sidekeys_validate.py
+# 旧版把这三份装在本机管理员目录 /usr/local 下。包不该往 /usr/local 写东西，
+# 所以挪开而不是直接删：改名留底，出问题可以原样挪回去。
+for legacy in /usr/local/bin/sidekeys-apply /usr/local/bin/sidekeys-run /usr/local/lib/sidekeys/sidekeys_validate.py; do
+  if [ -e "$legacy" ]; then
+    mv "$legacy" "$legacy.pre-lib-backup"
+    echo "   已留底旧路径文件：$legacy → $legacy.pre-lib-backup（确认无用后可删）"
+  fi
+done
 install -m 0644 "$REPO/data/org.andeyunhui.sidekeys.policy" /usr/share/polkit-1/actions/
 install -m 0644 "$REPO/contrib/sidekeys.service" "/etc/systemd/system/${UNIT}.service"
 # 反向也声明一次互斥：这样无论 sidekeys 与 keyd 谁先被 enable、谁先启动，
@@ -170,10 +179,10 @@ install -m 0644 "$REPO/contrib/sidekeys.service" "/etc/systemd/system/${UNIT}.se
 install -d -m 0755 /etc/systemd/system/keyd.service.d
 install -m 0644 "$REPO/contrib/10-keyd-exclusivity.conf" \
   /etc/systemd/system/keyd.service.d/10-exclusivity.conf
-bash -n /usr/local/bin/sidekeys-apply
-bash -n /usr/local/bin/sidekeys-run
+bash -n /usr/lib/sidekeys/sidekeys-apply
+bash -n /usr/lib/sidekeys/sidekeys-run
 python3 -c 'import yaml' 2>/dev/null || { echo "缺 python3-yaml（Ubuntu: apt install python3-yaml）" >&2; exit 1; }
-python3 /usr/local/lib/sidekeys/sidekeys_validate.py /etc/xremap/config.yml
+python3 /usr/lib/sidekeys/sidekeys_validate.py /etc/xremap/config.yml
 "$XREMAP_BIN" --validate-config /etc/xremap/config.yml
 
 systemctl daemon-reload

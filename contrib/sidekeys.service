@@ -11,7 +11,7 @@ Before=keyd.service
 [Service]
 # 实际入口是 wrapper：systemd 会把展开后的变量按空白拆成多个参数，而设备名里几乎总带空格，
 # 所以必须由 shell 负责引号。见 contrib/sidekeys-run。
-ExecStart=/usr/local/bin/sidekeys-run
+ExecStart=/usr/lib/sidekeys/sidekeys-run
 
 # “+”前缀表示这一行始终以 root 运行（User= 只作用于主进程）。
 # Ubuntu 上 logind 的 uaccess 会把 /dev/uinput 的 ACL group:: 降成 ---，
