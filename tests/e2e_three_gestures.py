@@ -48,10 +48,13 @@ def activate(a):
         elif state["phase"] == 1 and state["toasts"]:
             cfg = open(sk.CONFIG_PATH).read()
             log.append("  --- apply 后的配置 ---\n" + "\n".join("    " + l for l in cfg.splitlines()))
+            import yaml as _yaml
+            _doc = _yaml.safe_load(cfg)
+            _mod = (((_doc.get("modmap") or [{}])[0]).get("remap") or {})
             for probe, name in [
                 ("modmap" in cfg, "配置含 modmap"),
                 ("experimental_map" in cfg, "配置含 experimental_map"),
-                ("held: C-x" in cfg.replace("\n", " ").replace("    ", " ") or "held: C-x" in cfg, "held=C-x"),
+                (_mod.get("BTN_SIDE", {}).get("held") == ["CTRL_L", "x"], "held 用数组 [CTRL_L, x] 而不是被忽略的字符串"),
                 ("double: Enter" in cfg, "double=Enter"),
             ]:
                 log.append(f"  {'✓' if probe else '✗'} {name}")

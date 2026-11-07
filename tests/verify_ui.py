@@ -92,7 +92,10 @@ def inspect_():
     hcombo, hentry, hlabels = win.rows[("BTN_SIDE", "hold")]
     hcombo.set_selected(hlabels.index("剪切"))
     after2 = buf_text(preview)
-    check("选长按后预览出现 modmap 的 alone/held", "modmap" in after2 and "held: C-x" in after2.replace("\n", " ").replace("    ", " "), after2.replace("\n", "\\n")[:120])
+    import yaml
+    mod_remap = ((yaml.safe_load(after2).get("modmap") or [{}])[0]).get("remap", {})
+    check("选长按后 modmap 用数组形式表达组合（不是被静默忽略的字符串）",
+          mod_remap.get("BTN_SIDE", {}).get("held") == ["CTRL_L", "x"], str(mod_remap.get("BTN_SIDE")))
 
     # 交互：自定义 → 输入行可见且进入预览；非法键名被校验器拦住
     tcombo, tentry, tlabels = win.rows[("BTN_EXTRA", "tap")]

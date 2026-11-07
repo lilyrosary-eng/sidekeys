@@ -48,6 +48,14 @@ CORRECTIONS = {
     "side": "BTN_SIDE（触发键必须带 BTN_ 前缀）",
     "extra": "BTN_EXTRA（触发键必须带 BTN_ 前缀）",
 }
+MODIFIER_KEY_NAMES = {
+    "CTRL_L", "CTRL_R", "CONTROL_L", "CONTROL_R", "C_L", "C_R",
+    "SHIFT_L", "SHIFT_R", "S_L", "S_R",
+    "ALT_L", "ALT_R", "A_L", "A_R", "M_L", "M_R",
+    "SUPER_L", "SUPER_R", "WIN_L", "WIN_R", "W_L", "W_R",
+    "WINDOWS_L", "WINDOWS_R", "LEFTCTRL", "RIGHTCTRL", "LEFTSHIFT", "RIGHTSHIFT",
+    "LEFTALT", "RIGHTALT", "LEFTMETA", "RIGHTMETA",
+}
 BTN_CODES = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 # xremap 自己的别名表（src/config/key.rs）把这些映射到 evdev 名，所以它们也是合法“键名”。
 # 漏了这些就会误杀合法配置——我第一次就漏了 Ctrl_L。
@@ -157,6 +165,36 @@ def _walk_action(value, where, errors, known):
         errors.append(f"{where}: 不支持的值类型 {type(value).__name__}")
 
 
+def _check_modmap_shape(code, target, errors):
+    """modmap 的 alone/held 有自己的坑，单独查。
+
+    实测：`alone: S-Insert` 会被 xremap 静默忽略（modmap 不校验键名，--validate-config
+    也照样通过），必须写成 [SHIFT_L, Insert]；而数组是“同时按下”，不是宏序列。
+    """
+    if not isinstance(target, dict):
+        return
+    for slot in ("alone", "held"):
+        if slot not in target:
+            continue
+        value = target[slot]
+        where = f"{code}.{slot}"
+        if isinstance(value, str):
+            if value == "[]":
+                continue
+            if "-" in value:
+                errors.append(f"modmap {where}: “{value}” 这种组合字符串不会被 modmap 接受（实测被静默忽略），"
+                              f"请写成数组，例如 [SHIFT_L, Insert]")
+            check_token(value, f"modmap {where}", errors, _known_names())
+        elif isinstance(value, list):
+            mods = [v for v in value if str(v).upper() in MODIFIER_KEY_NAMES]
+            keys = [v for v in value if str(v).upper() not in MODIFIER_KEY_NAMES]
+            if len(keys) > 1:
+                errors.append(f"modmap {where}: 数组里的多个普通键是“同时按下”，不是宏序列；"
+                              f"要序列请放进点按（keymap）")
+            for item in value:
+                check_token(str(item), f"modmap {where} 数组项", errors, _known_names())
+
+
 def _walk_block(block, section, errors, known):
     if not isinstance(block, dict):
         errors.append(f"{section}: 列表项必须是映射")
@@ -170,6 +208,8 @@ def _walk_block(block, section, errors, known):
         return
     for trigger, target in remap.items():
         check_token(str(trigger), f"{section}.remap 触发键 {trigger}", errors, known)
+        if section.startswith("modmap"):
+            _check_modmap_shape(str(trigger), target, errors)
         _walk_action(target, f"{section}.remap[{trigger}]", errors, known)
 
 

@@ -75,6 +75,71 @@ def _val(token):
     return token
 
 
+MOD_ALIASES = {
+    "c": "CTRL_L", "ctrl": "CTRL_L", "control": "CTRL_L",
+    "s": "SHIFT_L", "shift": "SHIFT_L",
+    "a": "ALT_L", "alt": "ALT_L", "m": "ALT_L",
+    "w": "SUPER_L", "super": "SUPER_L", "win": "SUPER_L", "windows": "SUPER_L",
+}
+MOD_NAMES = {"CTRL_L", "CTRL_R", "SHIFT_L", "SHIFT_R", "ALT_L", "ALT_R",
+             "SUPER_L", "SUPER_R", "M_L", "M_R", "W_L", "W_R", "A_L", "A_R",
+             "C_L", "C_R", "S_L", "S_R"}
+SEQUENCE_IN_MODMAP = "modmap 的 alone/held 只能表达“同时按下”，不能写逗号分隔的宏序列；宏请放在点按里"
+MOD_SPAN_WARN = "数组里同时有修饰键和多个普通键时，修饰键会一直按住到最后那个键（例如 [SHIFT_L, Insert, Enter] 会变成 Shift+Enter）"
+
+
+def split_combo(token):
+    """把 keymap 风格的组合（C-c / Shift-A-Tab）拆成 modmap 需要的数组形式。"""
+    parts = [p.strip() for p in token.split("-")]
+    base = parts[-1]
+    mods = []
+    for p in parts[:-1]:
+        alias = MOD_ALIASES.get(p.lower())
+        if not alias:
+            raise ValueError(f"“{token}”里的“{p}”不是可识别的修饰键")
+        mods.append(alias)
+    return mods, base
+
+
+def _chord(token):
+    """modmap 的 alone/held 值：组合必须写成 [CTRL_L, c] 这种数组。
+
+    实测 `alone: S-Insert` 会被 xremap 静默忽略（modmap 不校验键名，--validate-config
+    也照样说 valid），只有 `alone: [SHIFT_L, Insert]` 才真的发事件。
+    """
+    if token is None or token == "" or token == "[]":
+        return []
+    if "," in token:
+        raise ValueError(SEQUENCE_IN_MODMAP)
+    mods, base = split_combo(token)
+    if not mods:
+        return base
+    return mods + [base]
+
+
+def _unchord(value):
+    """把 modmap 数组形式还原成界面上的组合写法，保证读回一致。"""
+    if value is None:
+        return None
+    if value == []:
+        return "[]"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if len(value) == 1:
+            return str(value[0])
+        parts = [str(v) for v in value]
+        base = parts[-1]
+        mods = []
+        for m in parts[:-1]:
+            key = m.upper()
+            if key not in MOD_NAMES:
+                return ", ".join(parts)  # 不是纯修饰键前缀，原样显示
+            mods.append({"CTRL": "C", "SHIFT": "S", "ALT": "A", "SUPER": "Super"}[key.split("_")[0]])
+        return "-".join(mods + [base])
+    return str(value)
+
+
 def dump_yaml(bindings, device):
     keymap_remap = {}
     modmap_remap = {}
@@ -84,11 +149,13 @@ def dump_yaml(bindings, device):
         tap, hold, dbl = b.get("tap"), b.get("hold"), b.get("double")
         if hold:
             # 有长按时，点按走 modmap 的 alone，避免同一键在两层各说一遍
-            modmap_remap[code] = {"alone": _val(tap) or [], "held": _val(hold)}
+            modmap_remap[code] = {"alone": _chord(tap), "held": _chord(hold)}
         elif tap is not None:
             keymap_remap[code] = _val(tap) if tap else []
         if dbl:
-            expmap_remap[code] = {"double": _val(dbl), "timeout": DOUBLE_TIMEOUT}
+            if "," in dbl or "-" in dbl:
+                raise ValueError("双击只支持单个键名（例如 Enter、F13），不支持组合或宏序列")
+            expmap_remap[code] = {"double": dbl, "timeout": DOUBLE_TIMEOUT}
 
     doc = {}
     if keymap_remap:
@@ -138,9 +205,9 @@ def read_current():
             if code not in bindings or not isinstance(target, dict):
                 continue
             if "alone" in target:
-                bindings[code]["tap"] = token_of(target["alone"])
+                bindings[code]["tap"] = _unchord(target["alone"])
             if "held" in target:
-                bindings[code]["hold"] = token_of(target["held"])
+                bindings[code]["hold"] = _unchord(target["held"])
         only = (block.get("device") or {}).get("only")
         if only and not device:
             device = str(only[0])
@@ -390,7 +457,12 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
     def _update_preview(self):
         bindings = self.current_bindings()
-        self.preview_text.get_buffer().set_text(dump_yaml(bindings, self._selected_device()))
+        try:
+            payload = dump_yaml(bindings, self._selected_device())
+        except ValueError as exc:
+            self.title_widget.set_subtitle(f"写法有误：{exc}")
+            return
+        self.preview_text.get_buffer().set_text(payload)
         self.title_widget.set_subtitle(self._describe(bindings))
 
     def _refresh_status(self):
@@ -421,7 +493,11 @@ class SideKeysWindow(Adw.ApplicationWindow):
         if not device:
             self._toast("没有可选的鼠标设备。本工具刻意只接管单个设备，不去抓全部键盘", error=True)
             return
-        payload = dump_yaml(bindings, device)
+        try:
+            payload = dump_yaml(bindings, device)
+        except ValueError as exc:
+            self._toast(str(exc), error=True)
+            return
         if "BTN_SIDE" not in payload and "BTN_EXTRA" not in payload:
             self._toast("生成的配置里没有任何侧键绑定，已中止", error=True)
             return

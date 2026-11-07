@@ -2,6 +2,27 @@
 
 遵循 Keep a Changelog / SemVer 风格。
 
+## 0.2.2 — 2026-11-07
+
+### 修复（线上事故：设了长按的侧键完全没反应）
+
+- **`modmap` 的 `alone`/`held` 之前写成 keymap 风格的组合字符串**（`alone: S-Insert`），
+  xremap 会**静默忽略**它：`--validate-config` 说 valid、服务 active、界面报“已生效”，
+  但事件一个都不发。实测对照证据：同一份配置里 `BTN_SIDE: Enter`（键→键）与
+  `BTN_EXTRA: {alone: [SHIFT_L, Insert], held: [CTRL_L, C]}`（数组形式）都能正常发出事件，
+  而字符串形式的组合不行。现在生成器把组合拆成数组：`C-c` → `[CTRL_L, c]`。
+- 校验器补上三条 modmap 专项规则：拒绝 `alone/held` 里的组合字符串（并给出数组示例）、
+  拒绝数组里出现多个普通键（那是“同时按下”，不是宏序列）、放行正确数组写法。
+- 读回也对称：`[CTRL_L, x]` 在界面里显示回 `C-x`。
+- 双击（`experimental_map`）现在限制为**单个键名**：组合或宏序列会被界面直接拒绝。
+
+### 说明
+
+- 宏序列只能放在**点按**（`keymap`）里；`modmap` 的数组是“同时按下”语义，
+  所以“粘贴后回车”这类序列+组合的诉求应该拆成两个手势（例如双击=回车）。
+- 修饰键在 `alone/held` 数组里会一直按住到最后一个键，因此
+  `[SHIFT_L, Insert, Enter]` 实际是 Shift+Enter —— 不要这么写。
+
 ## 0.2.1 — 2026-11-07
 
 ### 修复

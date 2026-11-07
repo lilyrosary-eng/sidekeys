@@ -62,6 +62,26 @@ check("拦住未知顶层区块", bool(errs_of(cfg(BTN_SIDE={"tap": "C-c"}) + "f
 check("拦住空文件", bool(errs_of("")))
 check("拦住两个侧键都没绑定", bool(errs_of(cfg())))
 
+# ---------- 2b) modmap 的真实坑（线上事故根因，实测 xremap 会静默忽略）----------
+check("拦住 modmap 里的组合字符串", any("数组" in x and "modmap" in x for x in errs_of('''modmap:
+  - name: 长按行为
+    remap:
+      BTN_EXTRA:
+        alone: S-Insert
+        held: Enter
+''')))
+check("拦住 modmap 数组里的多个普通键", bool(errs_of('''modmap:
+  - remap:
+      BTN_EXTRA:
+        held: [C, V]
+''')))
+check("放行 modmap 的正确数组写法", not errs_of('''modmap:
+  - remap:
+      BTN_EXTRA:
+        alone: [SHIFT_L, Insert]
+        held: [CTRL_L, C]
+'''))
+
 # ---------- 3) 配置生成形状 ----------
 def sections(text):
     return set(yaml.safe_load(text))
@@ -79,7 +99,7 @@ one = cfg(BTN_SIDE={"tap": "C-c"})
 check("只有点按 → 只写 keymap", sections(one) == {"keymap"}, str(sections(one)))
 two = cfg(BTN_SIDE={"tap": "C-c", "hold": "C-x"})
 check("有点按+长按 → 只写 modmap，不重复写 keymap", sections(two) == {"modmap"}, str(sections(two)))
-check("长按生成 alone/held 结构", remap_of(two, "modmap")["BTN_SIDE"] == {"alone": "C-c", "held": "C-x"}, str(two))
+check("长按生成 alone/held 结构", remap_of(two, "modmap")["BTN_SIDE"] == {"alone": ["CTRL_L", "c"], "held": ["CTRL_L", "x"]}, str(two))
 mixed = cfg(BTN_SIDE={"tap": "C-c"}, BTN_EXTRA={"tap": "S-Insert", "hold": "Enter"})
 check("两键分工不同 → keymap 与 modmap 并存", sections(mixed) == {"keymap", "modmap"}, str(sections(mixed)))
 check("keymap 里只放没有长按的那个键", set(remap_of(mixed, "keymap")) == {"BTN_SIDE"}, str(remap_of(mixed, "keymap")))
