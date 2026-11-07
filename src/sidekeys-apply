@@ -1,12 +1,15 @@
 #!/bin/bash
 # sidekeys-apply —— 侧键映射工具的 root 侧。只被 pkexec 调用，刻意不接受任意命令。
 #
-#   sidekeys-apply apply <暂存 yml> <设备名>   校验 → 备份 → 写入 → 重启服务（失败自动回滚）
-#   sidekeys-apply restore                     恢复上一次备份
-#   sidekeys-apply start | stop                启停服务
+#   sidekeys-apply apply <暂存文件> <设备名> [xremap|keyd]   校验 → 备份 → 写入 → 只让一个引擎运行
+#   sidekeys-apply restore                                     恢复当前后端的上一版备份
+#   sidekeys-apply start | stop                                启停当前后端的单元
 #
-# 设备名写进 /etc/xremap/sidekeys.env，systemd unit 用 --device "$SIDEKEYS_DEVICE" 读取，
-# 这样换鼠标只要改配置，不用碰 unit；也保证永远只接管一个设备。
+# 为什么必须“只让一个引擎运行”：xremap 与 keyd 都用 EVIOCGRAB 独占同一只鼠标，
+# 两个都跑就是一个永远读不到事件（而且是静默的）。所以切后端时另一边必须 stop+disable。
+#
+# xremap 路线：设备名写进 /etc/xremap/sidekeys.env，unit 用 --device "$SIDEKEYS_DEVICE" 读取。
+# keyd 路线：接管范围写在配置自身的 [ids]（vid:pid），所以 <设备名> 在这条路上只是留痕。
 
 set -euo pipefail
 
@@ -16,104 +19,161 @@ BACKUP=/etc/xremap/config.yml.bak
 XREMAP=/usr/bin/xremap
 VALIDATOR=/usr/local/lib/sidekeys/sidekeys_validate.py
 UNIT=sidekeys
+KEYD_UNIT=keyd
+KEYD_CONF_DIR=/etc/keyd
+KEYD_CONF=/etc/keyd/sidekeys.conf
+KEYD_BACKUP=/etc/keyd/sidekeys.conf.bak
+KEYD_BIN=/usr/bin/keyd.rvaiya
 
 die() { echo "$*" >&2; exit 1; }
 
-[ "$(id -u)" = 0 ] || die "请以 root 运行（正常途径是 pkexec）"
-[ -x "$XREMAP" ] || die "没找到 $XREMAP：先安装 xremap（见 README）"
+backend_of_arg() {
+    case "${1:-xremap}" in
+        xremap|keyd) echo "$1" ;;
+        *) die "未知后端：$1（可用：xremap / keyd）" ;;
+    esac
+}
 
-wait_active() {
+# 没显式传后端时（restore/start/stop），以“谁在跑”为准
+active_backend() {
+    if [ "$(systemctl is-active "$KEYD_UNIT" 2>/dev/null || true)" = active ]; then
+        echo keyd
+    else
+        echo xremap
+    fi
+}
+
+wait_active() { # $1=unit
     for _ in 1 2 3 4 5 6; do
-        [ "$(systemctl is-active "$UNIT")" = active ] && return 0
+        [ "$(systemctl is-active "$1" 2>/dev/null || true)" = active ] && return 0
         sleep 0.5
     done
     return 1
 }
 
-logs() { journalctl -u "$UNIT" -n 8 --no-pager 2>&1 | tail -8; }
+logs() { journalctl -u "$1" -n 12 --no-pager 2>&1 | tail -12; }
 
-case "${1:-}" in
-    apply)
-        stage="${2:?用法: sidekeys-apply apply <yml 文件> <设备名>}"
-        device="${3:?缺少设备名：本工具刻意只接管单个设备}"
+apply_xremap() { # $1=stage $2=device
+    [ -x "$XREMAP" ] || die "没找到 $XREMAP：先安装 xremap（见 README）"
+    if ! out=$("$XREMAP" --validate-config "$1" 2>&1); then
+        die "配置校验未通过，已放弃写入：
+$out"
+    fi
+    validate_stage "$1"
 
-        # 设备名会被写进 systemd 环境文件，先做字符白名单：禁止换行、引号、反斜杠等
-        clean=$(printf '%s' "$device" | tr -cd '[:alnum:] .:_/-')
-        [ "$clean" = "$device" ] || die "设备名里有不被允许的字符：$device"
-        [ -n "$device" ] || die "设备名不能为空：本工具刻意只接管单个设备"
-        [ -r "$stage" ] || die "读不到 $stage"
-        [ -s "$stage" ] || die "暂存文件是空的，拒绝写入（否则侧键映射会被清空）"
+    mkdir -p "$(dirname "$CONF")"
+    [ -f "$CONF" ] && cp -a "$CONF" "$BACKUP"
+    install -m 0644 -o xremap -g xremap "$1" "$CONF"
+    printf 'SIDEKEYS_DEVICE="%s"\n' "$2" > "$ENVF"
+    chmod 0644 "$ENVF"
 
-        # 语法校验：不通过就根本不写盘
-        if ! out=$("$XREMAP" --validate-config "$stage" 2>&1); then
+    # 让 keyd 彻底让位（apt install 会把它 enable+start，不能只 stop）
+    systemctl disable --now "$KEYD_UNIT" >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+    if ! systemctl restart "$UNIT" || ! wait_active "$UNIT"; then
+        state=$(systemctl is-active "$UNIT" || true)
+        [ -f "$BACKUP" ] && { cp -a "$BACKUP" "$CONF"; systemctl restart "$UNIT" || true; }
+        die "$UNIT 启动失败（$state），已回滚到上一版配置。最近日志：
+$(logs "$UNIT")"
+    fi
+    echo "已生效（后端 xremap，单元 $UNIT $(systemctl is-active "$UNIT")，接管设备：$2）"
+}
+
+apply_keyd() { # $1=stage
+    [ -x "$KEYD_BIN" ] || die "没找到 $KEYD_BIN：先装 keyd（apt install keyd，包名里的可执行文件就叫这个）"
+    validate_stage "$1"
+
+    mkdir -p "$KEYD_CONF_DIR"
+    [ -f "$KEYD_CONF" ] && cp -a "$KEYD_CONF" "$KEYD_BACKUP"
+    install -m 0644 "$1" "$KEYD_CONF"
+
+    # xremap 让位，否则它先 grab 掉鼠标，keyd 一个事件都读不到
+    systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+    if ! systemctl enable --now "$KEYD_UNIT" >/dev/null 2>&1 || ! wait_active "$KEYD_UNIT"; then
+        state=$(systemctl is-active "$KEYD_UNIT" || true)
+        [ -f "$KEYD_BACKUP" ] && { cp -a "$KEYD_BACKUP" "$KEYD_CONF"; systemctl restart "$KEYD_UNIT" || true; }
+        die "$KEYD_UNIT 启动失败（$state），已回滚。最近日志：
+$(logs "$KEYD_UNIT")"
+    fi
+    # keyd 报配置错误是 `ERROR: line <n>: ...`，而且它带着坏配置继续跑；
+    # 服务 active ≠ 配置生效，所以这里单独查一遍，有 ERROR 就回滚。
+    sleep 1
+    errs=$(journalctl -u "$KEYD_UNIT" --since "-8 seconds" --no-pager 2>&1 | grep -E "ERROR: line" || true)
+    if [ -n "$errs" ]; then
+        if [ -f "$KEYD_BACKUP" ]; then
+            cp -a "$KEYD_BACKUP" "$KEYD_CONF"
+            systemctl restart "$KEYD_UNIT" || true
+        fi
+        die "keyd 拒绝这份配置（已回滚到上一版）：
+$errs"
+    fi
+    echo "已生效（后端 keyd，单元 $KEYD_UNIT $(systemctl is-active "$KEYD_UNIT")；接管范围见配置里的 [ids]）"
+}
+
+validate_stage() { # $1=stage
+    [ -r "$1" ] || die "读不到 $1"
+    [ -s "$1" ] || die "暂存文件是空的，拒绝写入（否则侧键映射会被清空）"
+    if [ -r "$VALIDATOR" ]; then
+        if ! out=$(python3 "$VALIDATOR" "$1" 2>&1); then
             die "配置校验未通过，已放弃写入：
 $out"
         fi
+        return 0
+    fi
+    # 校验器缺失时至少守住语义门：必须有一个侧键被绑定（两种写法都查）
+    if ! grep -qE "BTN_SIDE|BTN_EXTRA|mouse[0-9]" "$1"; then
+        die "配置里没有任何侧键映射，拒绝写入（防止误清空现有映射）"
+    fi
+    echo "提示：缺少 $VALIDATOR，只做了最小语义检查" >&2
+}
 
-        # 深度校验：xremap 自己**不校验 modmap 里的键名**（实测 held: [TotallyBogus] 也算
-        # “Config is valid”），所以错键名会静默失效而服务照常 active。这一步补上键名与语义检查。
-        if [ -r "$VALIDATOR" ]; then
-            if ! out=$(python3 "$VALIDATOR" "$stage" 2>&1); then
-                die "配置校验未通过，已放弃写入：
-$out"
-            fi
-        else
-            # 校验器缺失时至少守住语义门：必须有一个侧键被绑定
-            if ! python3 - "$stage" <<'PY'
-import sys
-import yaml
+case "${1:-}" in
+    apply)
+        stage="${2:?用法: sidekeys-apply apply <文件> <设备名> [后端]}"
+        device="${3:?缺少设备名：本工具刻意只接管单个设备}"
+        backend=$(backend_of_arg "${4:-xremap}")
 
-try:
-    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
-except Exception:
-    sys.exit(1)
-for section in ("keymap", "modmap", "experimental_map"):
-    for block in doc.get(section) or []:
-        remap = block.get("remap") if isinstance(block, dict) else None
-        if remap and any(code in remap for code in ("BTN_SIDE", "BTN_EXTRA")):
-            sys.exit(0)
-sys.exit(1)
-PY
-            then
-                die "配置里没有任何侧键映射，拒绝写入（防止误清空现有映射）"
-            fi
-            echo "提示：缺少 $VALIDATOR，只做了最小语义检查" >&2
-        fi
+        # 设备名会进 systemd 环境文件，先做字符白名单：禁止换行、引号、反斜杠等
+        clean=$(printf '%s' "$device" | tr -cd '[:alnum:] .:_/-')
+        [ "$clean" = "$device" ] || die "设备名里有不被允许的字符：$device"
+        [ -n "$device" ] || die "设备名不能为空：本工具刻意只接管单个设备"
 
-        mkdir -p "$(dirname "$CONF")"
-        [ -f "$CONF" ] && cp -a "$CONF" "$BACKUP"
-        install -m 0644 -o xremap -g xremap "$stage" "$CONF"
-        printf 'SIDEKEYS_DEVICE="%s"\n' "$device" > "$ENVF"
-        chmod 0644 "$ENVF"
-
-        systemctl daemon-reload
-        if ! systemctl restart "$UNIT" || ! wait_active; then
-            state=$(systemctl is-active "$UNIT" || true)
-            if [ -f "$BACKUP" ]; then
-                cp -a "$BACKUP" "$CONF"
-                systemctl restart "$UNIT" || true
-            fi
-            die "$UNIT 启动失败（$state），已回滚到上一版配置。最近日志：
-$(logs)"
-        fi
-
-        echo "已生效（$UNIT $(systemctl is-active "$UNIT")，接管设备：$device）"
+        case "$backend" in
+            keyd)   apply_keyd "$stage" ;;
+            xremap) apply_xremap "$stage" "$device" ;;
+        esac
         ;;
     restore)
-        [ -f "$BACKUP" ] || die "没有可恢复的备份（$BACKUP 不存在）"
-        cp -a "$BACKUP" "$CONF"
-        systemctl restart "$UNIT"
-        wait_active || die "恢复后服务没能启动：$(logs)"
-        echo "已恢复上一版配置"
+        backend=$(active_backend)
+        if [ "$backend" = keyd ]; then
+            [ -f "$KEYD_BACKUP" ] || die "keyd 这边没有可恢复的备份（$KEYD_BACKUP 不存在）"
+            cp -a "$KEYD_BACKUP" "$KEYD_CONF"
+            systemctl restart "$KEYD_UNIT"
+            wait_active "$KEYD_UNIT" || die "恢复后 $KEYD_UNIT 没起来：$(logs "$KEYD_UNIT")"
+            echo "已恢复 keyd 的上一版配置"
+        else
+            [ -f "$BACKUP" ] || die "xremap 这边没有可恢复的备份（$BACKUP 不存在）"
+            cp -a "$BACKUP" "$CONF"
+            systemctl restart "$UNIT"
+            wait_active "$UNIT" || die "恢复后服务没能启动：$(logs "$UNIT")"
+            echo "已恢复 xremap 的上一版配置"
+        fi
         ;;
     start)
-        systemctl start "$UNIT"
-        wait_active || die "启动失败：$(logs)"
-        echo "服务已启动"
+        backend=$(active_backend)
+        unit=$([ "$backend" = keyd ] && echo "$KEYD_UNIT" || echo "$UNIT")
+        systemctl start "$unit"
+        wait_active "$unit" || die "启动失败：$(logs "$unit")"
+        echo "服务已启动（$unit）"
         ;;
     stop)
-        systemctl stop "$UNIT"
-        echo "服务已停止（侧键恢复鼠标默认行为）"
+        for unit in "$UNIT" "$KEYD_UNIT"; do
+            systemctl stop "$unit" 2>/dev/null || true
+        done
+        echo "两个后端的单元都已停止（侧键恢复鼠标默认行为）"
         ;;
     *)
         die "未知子命令：${1:-}（可用：apply / restore / start / stop）"

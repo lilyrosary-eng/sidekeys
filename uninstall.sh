@@ -47,6 +47,13 @@ echo
 echo "== 系统侧 =="
 systemctl stop "$UNIT" 2>/dev/null || true
 systemctl disable "$UNIT" 2>/dev/null || true
+# 只有本工具确实接管过 keyd（写过我们的配置文件）才去碰它：
+# keyd 可能是用户为自己键盘装的，不能顺手 disable。
+if [ -f /etc/keyd/sidekeys.conf ]; then
+  systemctl disable --now keyd 2>/dev/null || true
+  rm -f /etc/keyd/sidekeys.conf /etc/keyd/sidekeys.conf.bak
+  echo "已移除本工具写入的 /etc/keyd/sidekeys.conf 并停止 keyd；侧键恢复鼠标默认行为"
+fi
 rm -f "/etc/systemd/system/${UNIT}.service"
 rm -f /usr/local/bin/sidekeys-apply
 rm -f /usr/local/bin/sidekeys-run

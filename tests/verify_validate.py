@@ -15,6 +15,16 @@ import sidekeys_validate as sv  # noqa: E402
 results = []
 
 
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    except Exception as exc:
+        return f"抛的是 {type(exc).__name__}，不是 ValueError"
+    return False
+
+
 def check(name, ok, detail=""):
     results.append((name, bool(ok), detail))
 
@@ -138,7 +148,7 @@ with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf
     p = fh.name
 old, sk.CONFIG_PATH = sk.CONFIG_PATH, p
 try:
-    got, dev, ht = sk.read_current()
+    got, dev, ht, backend, ar = sk.read_current()
 finally:
     sk.CONFIG_PATH = old
 os.unlink(p)
@@ -149,6 +159,112 @@ check("round-trip 双击", got["BTN_SIDE"]["double"] == "Enter", str(got))
 check("round-trip 另一键点按", got["BTN_EXTRA"]["tap"] == "S-Insert", str(got))
 check("round-trip 设备名", dev == "Test Mouse", str(dev))
 check("round-trip 未启用项为空", got["BTN_EXTRA"]["hold"] is None and got["BTN_EXTRA"]["double"] is None, str(got))
+
+# ---------- 5) keyd 后端：生成 / 读回 / 校验 ----------
+def kb(**kw):
+    b = {k: {"tap": None, "hold": None, "double": None} for k, _ in sk.BUTTONS}
+    for code, gestures in kw.items():
+        b[code].update(gestures)
+    return sk.dump_keyd(b, "3151:3022", 300, True)
+
+
+KEYD_LEGAL = [
+    ("点按复制", kb(BTN_SIDE={"tap": "C-c"})),
+    ("点按+长按回车（一次性宏）", kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"})),
+    ("只有长按（点按留空＝noop）", kb(BTN_SIDE={"hold": "Enter"})),
+    ("屏蔽该键", kb(BTN_SIDE={"tap": "[]"}, BTN_EXTRA={"tap": "C-v"})),
+    ("宏序列走 macro()", kb(BTN_SIDE={"tap": "C-c, Enter"})),
+    ("Super 前缀映射到 M-", kb(BTN_SIDE={"tap": "Super-L"})),
+    ("AltGr 前缀 G-", kb(BTN_SIDE={"tap": "G-2"})),
+]
+for name, text in KEYD_LEGAL:
+    check(f"keyd 合法写法不被误杀：{name}", not errs_of(text), str(errs_of(text))[:120])
+
+check("keyd 长按用 timeout(点按, 毫秒, 动作)",
+      "mouse1 = timeout(C-insert, 300, macro2(0, 0, enter))" in kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}),
+      kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}).replace("\n", "\\n")[-90:])
+check("keyd 自动释放关闭时不包 macro2",
+      "macro2" not in sk.dump_keyd({"BTN_SIDE": {"tap": None, "hold": "Enter", "double": None},
+                                    "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                                   "3151:3022", 300, False))
+check("keyd 有双击直接报错（上游没有算子）",
+      _raises(lambda: sk.dump_keyd({"BTN_SIDE": {"tap": None, "hold": None, "double": "Enter"},
+                                    "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                                   "3151:3022", 300, True)))
+check("keyd 没设备会拒绝盲写 ids",
+      _raises(lambda: sk.dump_keyd({"BTN_SIDE": {"tap": "C-c", "hold": None, "double": None},
+                                    "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                                   "", 300, True)))
+check("keyd 阈值越界在生成阶段就被拒",
+      _raises(lambda: sk.dump_keyd({"BTN_SIDE": {"tap": None, "hold": "Enter", "double": None},
+                                    "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                                   "3151:3022", 9000, True))
+      and _raises(lambda: sk.dump_keyd({"BTN_SIDE": {"tap": None, "hold": "Enter", "double": None},
+                                        "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                                       "3151:3022", "abc", True)))
+
+KEYD_ILLEGAL = [
+    ("阈值越界", kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}).replace(", 300,", ", 9000,")),
+    ("阈值非数字", kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}).replace(", 300,", ", fast,")),
+    ("乱造键名", kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}).replace("enter))", "totallybogus))")),
+    ("错误修饰前缀", kb(BTN_SIDE={"tap": "C-Insert"}).replace("C-insert", "H-insert")),
+    ("ids 用 *", "[ids]\n\n*\n\n[main]\n\nmouse1 = c-c\n"),
+    ("ids 写成设备名", "[ids]\n\nYICHIP Wireless Device Mouse\n\n[main]\n\nmouse1 = c-c\n"),
+    ("两个侧键都没绑", "[ids]\n\n3151:3022\n\n[main]\n\n# 空\n"),
+    ("timeout 少参数", "[ids]\n\n3151:3022\n\n[main]\n\nmouse1 = timeout(c-insert, 300)\n"),
+    ("裸绑定行也要走 keyd 规则（不给 YAML 式误导）",
+     "mouse1 = timeout(c-insert, 300)\n"),
+]
+for name, text in KEYD_ILLEGAL:
+    got = errs_of(text)
+    check(f"keyd 拦住：{name}", bool(got), str(got)[:120])
+BARE = "mouse1 = timeout(c-insert, 300)\n"
+check("keyd 裸绑定行报的是 keyd 的错",
+      any("keyd" in x or "ids" in x for x in errs_of(BARE)), str(errs_of(BARE))[:120])
+
+# keyd 配置读回（与生成器互为逆运算）
+rt = kb(BTN_SIDE={"tap": "C-Insert", "hold": "Enter"}, BTN_EXTRA={"tap": "S-Insert"})
+dev_rt, b_rt, ms_rt, ar_rt = sk.parse_keyd(rt)
+check("keyd round-trip 设备 id", dev_rt == "3151:3022", str(dev_rt))
+check("keyd round-trip 点按", b_rt["BTN_SIDE"]["tap"] == "C-Insert" and b_rt["BTN_EXTRA"]["tap"] == "S-Insert", str(b_rt))
+check("keyd round-trip 长按", b_rt["BTN_SIDE"]["hold"] == "Enter" and b_rt["BTN_EXTRA"]["hold"] is None, str(b_rt))
+check("keyd round-trip 阈值", ms_rt == 300, str(ms_rt))
+check("keyd round-trip 自动释放", ar_rt is True, str(ar_rt))
+check("keyd 生成→读回→再生成 幂等",
+      sk.dump_keyd(b_rt, dev_rt, ms_rt, ar_rt) == rt, "见上一条")
+no_ar = sk.dump_keyd({"BTN_SIDE": {"tap": None, "hold": "Enter", "double": None},
+                      "BTN_EXTRA": {"tap": None, "hold": None, "double": None}}, "3151:3022", 400, False)
+check("keyd 读回能识别未开自动释放", sk.parse_keyd(no_ar)[3] is False, str(sk.parse_keyd(no_ar)))
+
+# ---------- 6) 线上配置没写阈值时，--print 这条路径不能炸 ----------
+LEGACY = """keymap:
+- name: 侧键映射
+  device:
+    only:
+    - Test Mouse
+  remap:
+    BTN_SIDE: C-c
+"""
+with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="utf-8") as fh:
+    fh.write(LEGACY)
+    legacy_path = fh.name
+old_cfg = sk.CONFIG_PATH
+sk.CONFIG_PATH = legacy_path
+try:
+    b_legacy, d_legacy, ht_legacy, be_legacy, ar_legacy = sk.read_current()
+finally:
+    sk.CONFIG_PATH = old_cfg
+os.unlink(legacy_path)
+check("旧配置读回阈值为 None", ht_legacy is None, str(ht_legacy))
+out_legacy = sk.dump_config(be_legacy, b_legacy, d_legacy, ht_legacy, ar_legacy)
+check("纯点按的旧配置形状不变（不凭空塞进阈值、也不抛异常）",
+      "tap_timeout_millis" not in out_legacy, out_legacy.replace("\n", "\\n")[:110])
+hold_legacy = sk.dump_config(sk.XREMAP_BACKEND,
+                             {"BTN_SIDE": {"tap": "C-c", "hold": "Enter", "double": None},
+                              "BTN_EXTRA": {"tap": None, "hold": None, "double": None}},
+                             "Test Mouse", None, True)
+check("有长按时 None 阈值补成默认而不是报错",
+      f"tap_timeout_millis: {sk.HOLD_TIMEOUT_DEFAULT}" in hold_legacy, hold_legacy.replace("\n", "\\n")[-90:])
 
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:

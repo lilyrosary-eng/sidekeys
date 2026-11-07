@@ -80,6 +80,10 @@ echo "== 2. 检查 root 侧前提 =="
   exit 1
 }
 command -v setfacl >/dev/null || { echo "缺 setfacl（Ubuntu: apt install acl）" >&2; exit 1; }
+# keyd 是可选后端（长按到点即发），没有也能用 xremap，所以这里只提示不中断
+if [ ! -x /usr/bin/keyd.rvaiya ] && [ ! -x /usr/bin/keyd ]; then
+  echo "提示：没找到 keyd。想用“长按不等松手就发出”的后端时再装：sudo apt install keyd" >&2
+fi
 command -v python3 >/dev/null || { echo "缺 python3" >&2; exit 1; }
 
 echo

@@ -12,6 +12,7 @@
 
 import difflib
 import re
+import subprocess
 import sys
 
 try:
@@ -237,15 +238,185 @@ def _walk_block(block, section, errors, known):
         _walk_action(target, f"{section}.remap[{trigger}]", errors, known)
 
 
+# ------------------------------------------------------------------ keyd 路线
+#
+# keyd 的配置是 INI，不是 YAML，所以整个校验逻辑另起一套。它对坏配置的态度是
+# “打印 ERROR: line n: ... 然后继续跑”，服务 active 完全不代表配置生效，
+# 因此这一层的拒绝必须比它更早、更严。
+
+KEYD_ID_FORM = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+KEYD_SIDE_BUTTONS = ("mouse1", "mouse2")
+KEYD_KNOWN_KEYS = {"mouse1", "mouse2", "mouse3", "mouse4", "mouse5"}
+# man「LAYERS」原文：C=Control, M=Meta/Super, A=Alt, S=Shift, G=AltGr
+KEYD_MOD_PREFIXES = {"C", "S", "A", "M", "G"}
+KEYD_OPERATORS = {"timeout", "macro", "macro2"}
+KEYD_OTHER_ACTIONS = {"layer", "layerm", "oneshot", "oneshotm", "swap", "swapm", "toggle",
+                      "togglem", "clear", "clearm", "overload", "overloadt", "overloadt2",
+                      "overloadi", "lettermod", "setlayout", "command", "noop"}
+KEYD_NOOP = "noop"
+_keyd_names_cache = {}
+
+
+def _keyd_names():
+    """keyd 自己报告的合法键名；拿不到就返回 None，那时跳过键名检查而不是误杀。"""
+    if "names" in _keyd_names_cache:
+        return _keyd_names_cache["names"]
+    names = None
+    for binary in ("/usr/bin/keyd.rvaiya", "/usr/bin/keyd"):
+        try:
+            proc = subprocess.run([binary, "list-keys"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            names = set(proc.stdout.split())
+            break
+    _keyd_names_cache["names"] = names
+    return names
+
+
+def _split_top_commas(inner):
+    out, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def _check_keyd_expr(expr, where, errors, names):
+    expr = expr.strip()
+    if not expr:
+        errors.append(f"{where}: 表达式为空")
+        return
+    m = re.match(r"^(\w+)\((.*)\)$", expr, re.S)
+    if m:
+        op, inner = m.group(1), m.group(2)
+        if op in KEYD_OTHER_ACTIONS and op not in KEYD_OPERATORS:
+            errors.append(f"{where}: 本工具不生成 {op}(...)，请确认是否手改过配置")
+            return
+        if op == "timeout":
+            parts = _split_top_commas(inner)
+            if len(parts) != 3:
+                errors.append(f"{where}: timeout(点按, 毫秒, 长按) 需要 3 个参数，收到 {len(parts)} 个")
+                return
+            _check_keyd_expr(parts[0], f"{where}.点按", errors, names)
+            ms = parts[1].strip()
+            if not ms.isdigit():
+                errors.append(f"{where}: timeout 的第二个参数必须是整数毫秒，收到 {ms!r}")
+            elif not HOLD_TIMEOUT_MIN <= int(ms) <= HOLD_TIMEOUT_MAX:
+                errors.append(f"{where}: 长按阈值 {ms}ms 超出可用范围 {HOLD_TIMEOUT_MIN}~{HOLD_TIMEOUT_MAX}ms")
+            _check_keyd_expr(parts[2], f"{where}.长按", errors, names)
+            return
+        if op == "macro2":
+            parts = _split_top_commas(inner)
+            if len(parts) != 3:
+                errors.append(f"{where}: macro2(超时, 重复超时, 内容) 需要 3 个参数，收到 {len(parts)} 个")
+                return
+            for i, val in enumerate(parts[:2]):
+                if not val.strip().isdigit():
+                    errors.append(f"{where}: macro2 的第 {i + 1} 个参数必须是整数毫秒，收到 {val.strip()!r}")
+            _check_keyd_expr(parts[2], f"{where}.内容", errors, names)
+            return
+        # macro( … ) 内部是空格分隔的 token
+        for i, tok in enumerate(inner.split()):
+            _check_keyd_expr(tok, f"{where}.序列[{i}]", errors, names)
+        return
+
+    if expr == KEYD_NOOP:
+        return
+    parts = [x for x in expr.split("-") if x]
+    if not parts:
+        errors.append(f"{where}: 无法解析的写法 {expr!r}")
+        return
+    for prefix in parts[:-1]:
+        if prefix.upper() not in KEYD_MOD_PREFIXES:
+            errors.append(f"{where}: “{expr}” 里的 “{prefix}” 不是 keyd 的修饰前缀（只有 C/S/A/M/G）")
+    base = parts[-1].lower()
+    if names is not None and base not in names:
+        cand = difflib.get_close_matches(base, sorted(names), n=1, cutoff=0.72)
+        hint = f"，是否想写 {cand[0]}？" if cand else ""
+        errors.append(f"{where}: keyd 不认得键名 “{base}”{hint}")
+
+
+def _validate_keyd(text):
+    errors = []
+    names = _keyd_names()
+    ids, bindings, section = [], {}, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section is None:
+            errors.append("keyd 配置必须以 [ids] 开头")
+            continue
+        if section == "ids":
+            ids.append(line)
+            continue
+        if section != "main":
+            errors.append(f"本工具不写区块 [{section}]，请确认是否手改过配置")
+            continue
+        if "=" not in line:
+            errors.append(f"[main]: 无法解析的行 {line!r}")
+            continue
+        lhs, rhs = [x.strip() for x in line.split("=", 1)]
+        bindings[lhs] = rhs
+
+    if not ids:
+        errors.append("[ids] 为空：keyd 会接管所有输入设备，本工具刻意只接管单个设备")
+    for ident in ids:
+        if ident == "*":
+            errors.append("[ids]: 不允许 * —— 接管范围必须显式")
+        elif not KEYD_ID_FORM.match(ident):
+            errors.append(f"[ids]: “{ident}” 不是 vid:pid 形式（keyd 实测按 vid:pid 前缀匹配）")
+    if not any(k in bindings for k in KEYD_SIDE_BUTTONS):
+        errors.append("[main]: 两个侧键（mouse1/mouse2）都没有绑定，拒绝写入")
+    for lhs, rhs in bindings.items():
+        if lhs not in KEYD_KNOWN_KEYS:
+            errors.append(f"[main]: 本工具不生成 {lhs} 的绑定（只写 mouse1/mouse2）")
+            continue
+        _check_keyd_expr(rhs, f"[main] {lhs}", errors, names)
+    return errors
+
+
+def looks_like_keyd(text):
+    """有 INI 区块头，或者出现了 mouseN = 这种 keyd 绑定行，就按 keyd 规则校验。
+
+    光看区块头不够：文件被截断或手改坏了时会只剩裸的绑定行，
+    那种情况必须给出 keyd 的报错，而不是 “顶层必须是映射” 这种 YAML 味道的误导。
+    """
+    for line in text.splitlines():
+        if re.match(r"^\s*\[\s*(ids|main|global)\s*\]", line):
+            return True
+        if re.match(r"^\s*mouse[0-9]+\s*=", line):
+            return True
+    return False
+
+
 def validate(path):
     """返回错误列表；空列表表示可以安全写入。"""
     errors = []
     known = _known_names()
     try:
         with open(path, encoding="utf-8") as fh:
-            doc = yaml.safe_load(fh)
+            text = fh.read()
     except FileNotFoundError:
         return [f"文件不存在：{path}"]
+    # keyd 的配置是 INI，走完全另一套规则
+    if looks_like_keyd(text):
+        return _validate_keyd(text)
+    try:
+        doc = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         return [f"YAML 解析失败：{exc}"]
     if not isinstance(doc, dict):

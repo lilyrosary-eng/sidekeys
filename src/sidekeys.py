@@ -29,6 +29,9 @@ APPLY_HELPER = "/usr/local/bin/sidekeys-apply"
 VALIDATOR_PATHS = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidekeys_validate.py"),
                    "/usr/local/lib/sidekeys/sidekeys_validate.py")
 UNIT = "sidekeys"
+XREMAP_UNIT = "sidekeys"       # 我们自己的 xremap 服务单元
+KEYD_UNIT = "keyd"             # keyd 的上游单元；切后端时二选一运行
+KEYD_CONFIG_PATH = "/etc/keyd/sidekeys.conf"
 NO_DEVICE = "（没检测到鼠标设备）"
 NONE_LABEL = "（不启用）"
 DOUBLE_TIMEOUT = 200
@@ -151,6 +154,10 @@ def _unchord(value):
 
 
 def _hold_timeout_ms(value):
+    if value is None:
+        # 从线上配置读回来的“没写过阈值”是 None。这条路径不经过界面的 SpinRow，
+        # 不补齐的话 `sidekeys --print` 会直接抛 ValueError。
+        return HOLD_TIMEOUT_DEFAULT
     try:
         ms = int(value)
     except (TypeError, ValueError):
@@ -158,6 +165,191 @@ def _hold_timeout_ms(value):
     if not HOLD_TIMEOUT_MIN <= ms <= HOLD_TIMEOUT_MAX:
         raise ValueError(f"长按阈值只能在 {HOLD_TIMEOUT_MIN}~{HOLD_TIMEOUT_MAX} 毫秒之间")
     return ms
+
+
+# ---------------------------------------------------------------- keyd 后端
+#
+# 为什么要有第二个后端：xremap 的 modmap 对鼠标键只能在松手时发出长按动作
+# （进入 HoldDown 只靠 repeat 事件，而鼠标键不发 repeat）。keyd 的定时器在
+# 自己的事件循环里（evloop.c: poll 带 timeout → EV_TIMEOUT；keyboard.c:1064
+# `if (time >= pending_key.expire) action = action2` 后同步 process_descriptor），
+# 实测长按比物理松手早 956ms 发出。代价：keyd 没有双击算子（man 里只有 layer
+# toggle 的“按两次”），所以切到 keyd 就必须放弃双击手势。
+XREMAP_BACKEND = "xremap"
+KEYD_BACKEND = "keyd"
+BACKENDS = [
+    (XREMAP_BACKEND, "xremap（支持双击；长按要等松手才发）"),
+    (KEYD_BACKEND, "keyd（长按到点即发；不支持双击）"),
+]
+BACKEND_BY_LABEL = {label: name for name, label in BACKENDS}
+LABEL_BY_BACKEND = dict(BACKENDS)
+XREMAP_LABEL = LABEL_BY_BACKEND[XREMAP_BACKEND]   # 界面下拉上的字面值，测试也用得上
+KEYD_LABEL = LABEL_BY_BACKEND[KEYD_BACKEND]
+
+# 实测映射：device.c 把 BTN_SIDE→KEYD_MOUSE_1、BTN_EXTRA→KEYD_MOUSE_2，
+# 且 keyd monitor 确实按 mouse1 上报这只鼠标的侧键。
+KEYD_BUTTON = {"BTN_SIDE": "mouse1", "BTN_EXTRA": "mouse2"}
+# man「LAYERS」原文的修饰前缀：C=Control, M=Meta/Super, A=Alt, S=Shift, G=AltGr
+KEYD_MOD_PREFIXES = {
+    "C": "C", "CTRL": "C", "CONTROL": "C",
+    "S": "S", "SHIFT": "S",
+    "A": "A", "ALT": "A",
+    "M": "M", "W": "M", "WIN": "M", "WINDOWS": "M", "SUPER": "M",
+    "G": "G", "ALTGR": "G",
+}
+KEYD_NOOP = "noop"          # keys.c: [KEYD_NOOP] = { "noop", ... }，用来表达“屏蔽”
+
+
+def _keyd_chord(token):
+    parts = [p.strip() for p in token.split("-")]
+    base = parts[-1]
+    if not base:
+        raise ValueError(f"“{token}”缺少主键")
+    letters = []
+    for prefix in parts[:-1]:
+        letter = KEYD_MOD_PREFIXES.get(prefix.upper())
+        if not letter:
+            raise ValueError(f"“{token}”里的“{prefix}”不是 keyd 认得的修饰键（keyd 只有 C/S/A/M/G）")
+        letters.append(letter)
+    return "-".join(letters + [base.lower()])
+
+
+def to_keyd_expr(token, one_shot=False):
+    """界面写法（xremap 风格）→ keyd 表达式。对已经是 keyd 风格的输入是幂等的。"""
+    if token is None or token == "":
+        return None
+    if token == "[]":
+        return KEYD_NOOP
+    parts = [p.strip() for p in token.split(",") if p.strip()]
+    if len(parts) > 1:
+        expr = "macro(%s)" % " ".join(to_keyd_expr(part) for part in parts)
+    else:
+        expr = _keyd_chord(parts[0])
+    if one_shot:
+        # macro2 的 timeout 取 0 即关闭宏重复（man 原文）；实测关掉后 value=2 计数为 0
+        expr = f"macro2(0, 0, {expr})"
+    return expr
+
+
+KEYD_ID_FORM = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+
+
+def dump_keyd(bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT, auto_release=True):
+    """device 可以是鼠标名（界面里的值）也可以是已经解析好的 vid:pid。"""
+    # 阈值只在真的有长按时才求值：没绑长按的配置里凭空多一个数字没有意义
+    ms = _hold_timeout_ms(hold_timeout) if any(b.get("hold") for b in bindings.values()) else None
+    if not device:
+        raise ValueError("keyd 后端必须指定设备，否则会改到所有输入设备")
+    device_id = device if KEYD_ID_FORM.match(device) else device_id_for(device)
+    lines = ["# 由侧键映射工具生成。手改前先用 sidekeys --print 看现状。", "", "[ids]", "", device_id, "", "[main]", ""]
+    for code, cn in BUTTONS:
+        key = KEYD_BUTTON[code]
+        b = bindings[code]
+        tap, hold, dbl = b.get("tap"), b.get("hold"), b.get("double")
+        if dbl:
+            raise ValueError("keyd 没有双击算子：请在界面里清空双击，或改用 xremap 后端")
+        lines.append(f"# {cn}")
+        if hold:
+            tap_expr = to_keyd_expr(tap) if tap else KEYD_NOOP
+            lines.append(f"{key} = timeout({tap_expr}, {ms}, {to_keyd_expr(hold, one_shot=auto_release)})")
+        elif tap:
+            lines.append(f"{key} = {to_keyd_expr(tap)}")
+        else:
+            lines.append(f"# {key} = 未绑定")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _split_top_level(text):
+    """按逗号切，但忽略括号内的逗号（timeout(a, ms, b) 这种）。"""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _strip_one_shot(expr):
+    """macro2(0, 0, X) → (X, True)；其他原样返回。"""
+    expr = expr.strip()
+    m = re.match(r"^macro2\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(.+)\)$", expr, re.S)
+    if m:
+        return m.group(3).strip(), True
+    return expr, False
+
+
+_KEYD_TO_TOKEN = {to_keyd_expr(tok): tok for _lb, tok in PRESETS if tok and tok != "[]"}
+_KEYD_TO_TOKEN[KEYD_NOOP] = "[]"
+
+
+def _keyd_display(expr):
+    """keyd 表达式 → 界面里显示的写法；不认识的自定义写法原样显示。"""
+    expr, _one_shot = _strip_one_shot(expr)
+    if expr in _KEYD_TO_TOKEN:
+        return _KEYD_TO_TOKEN[expr]
+    if expr.startswith("macro(") and expr.endswith(")"):
+        # macro 内部是空格分隔的 token 序列，不是逗号
+        inner = expr[len("macro("):-1].split()
+        return ", ".join(_keyd_display(part) for part in inner)
+    return expr
+
+
+def parse_keyd(text):
+    """解析 keyd 配置 → (设备 id, {BTN_*: {tap, hold, double}}, 阈值毫秒, 自动释放)"""
+    device = None
+    bindings = {k: dict(v) for k, v in DEFAULT_BINDINGS.items()}
+    hold_timeout = None
+    section = None
+    hold_seen = one_shot_seen = False
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if "=" not in line:
+            if section == "ids":
+                device = device or line
+            continue
+        lhs, rhs = (p.strip() for p in line.split("=", 1))
+        if section != "main":
+            continue
+        code = next((c for c, k in KEYD_BUTTON.items() if k == lhs), None)
+        if code is None:
+            continue
+        if rhs.startswith("timeout(") and rhs.endswith(")"):
+            args = _split_top_level(rhs[len("timeout("):-1])
+            if len(args) == 3:
+                tap_expr, ms_expr, hold_expr = args
+                bindings[code]["tap"] = None if tap_expr == KEYD_NOOP else _keyd_display(tap_expr)
+                bindings[code]["hold"] = _keyd_display(hold_expr)
+                hold_seen = True
+                one_shot_seen = one_shot_seen or _strip_one_shot(hold_expr)[1]
+                try:
+                    hold_timeout = int(ms_expr)
+                except ValueError:
+                    hold_timeout = None
+        else:
+            bindings[code]["tap"] = _keyd_display(rhs)
+            bindings[code]["hold"] = None
+    # 没绑过长按时无所谓；绑过的话，只要有一个是 macro2 包裹就认为开了自动释放
+    return device, bindings, hold_timeout, (not hold_seen) or one_shot_seen
+
+
+def dump_config(backend, bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT, auto_release=True):
+    if backend == KEYD_BACKEND:
+        return dump_keyd(bindings, device, hold_timeout, auto_release)
+    return dump_yaml(bindings, device, hold_timeout)
 
 
 def dump_yaml(bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT):
@@ -203,8 +395,38 @@ def dump_yaml(bindings, device, hold_timeout=HOLD_TIMEOUT_DEFAULT):
     return header + yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
+def service_active(unit):
+    try:
+        proc = subprocess.run(["systemctl", "is-active", "--quiet", unit], timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def detect_backend():
+    """当前生效的后端以“谁在跑”为准，而不是某个文件里写过什么。
+
+    两个引擎都要 EVIOCGRAB 同一只鼠标，同时跑必然有一个抢不到；
+    所以 GUI 必须按活跃服务来决定读哪份配置、写哪份配置。
+    """
+    if service_active(KEYD_UNIT):
+        return KEYD_BACKEND
+    return XREMAP_BACKEND
+
+
 def read_current():
-    """返回 (绑定, 设备, 长按阈值)。阈值取线上配置里第一个出现的 tap_timeout_millis。"""
+    """返回 (绑定, 设备名, 长按阈值, 后端, 长按自动释放)。"""
+    backend = detect_backend()
+    if backend == KEYD_BACKEND:
+        try:
+            with open(KEYD_CONFIG_PATH, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            return {k: dict(v) for k, v in DEFAULT_BINDINGS.items()}, None, None, backend, True
+        vidpid, bindings, hold_timeout, auto_release = parse_keyd(text)
+        device = device_name_for_id(vidpid) if vidpid else None
+        return bindings, device, hold_timeout, backend, auto_release
+
     bindings = {k: dict(v) for k, v in DEFAULT_BINDINGS.items()}
     device = None
     hold_timeout = None
@@ -212,7 +434,7 @@ def read_current():
         with open(CONFIG_PATH, encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError):
-        return bindings, device, hold_timeout
+        return bindings, device, hold_timeout, backend, True
 
     def token_of(value):
         if value is None or value == []:
@@ -245,16 +467,16 @@ def read_current():
         for code, target in (block.get("remap") or {}).items():
             if code in bindings and isinstance(target, dict) and "double" in target:
                 bindings[code]["double"] = token_of(target["double"])
-    return bindings, device, hold_timeout
+    return bindings, device, hold_timeout, backend, True
 
 
-def list_mice():
-    names = []
+def _mouse_chunks():
+    """逐个产出 (设备名, sysfs 路径)，只留真正带 mouse handler 的物理设备。"""
     try:
         with open("/proc/bus/input/devices", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except OSError:
-        return names
+        return
     for chunk in text.split("\n\n"):
         handlers = re.search(r"H:\s+Handlers=(.*)", chunk)
         name = re.search(r'N:\s+Name="(.*)"', chunk)
@@ -265,8 +487,50 @@ def list_mice():
         if sysfs and "/devices/virtual/" in sysfs.group(1):
             continue
         if any(tok.startswith("mouse") for tok in handlers.group(1).split()) and "Touchpad" not in name.group(1):
-            names.append(name.group(1))
-    return names
+            yield name.group(1), (sysfs.group(1) if sysfs else "")
+
+
+def mouse_ids():
+    """鼠标名 → vid:pid。keyd 的 [ids] 只认 id；实测 vid:pid 前缀就能命中该设备的接口。"""
+    out = {}
+    for name, sysfs in _mouse_chunks():
+        m = re.search(r"([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\.[0-9a-fA-F]{4}", sysfs)
+        if m:
+            out[name] = f"{m.group(1)}:{m.group(2)}".lower()  # keyd 自己报的是小写十六进制
+    return out
+
+
+def device_id_for(name):
+    vidpid = mouse_ids().get(name)
+    if not vidpid:
+        raise ValueError(f"没能从 /proc/bus/input/devices 解析出“{name}”的 vid:pid，keyd 后端不能盲写 ids")
+    return vidpid
+
+
+def device_name_for_id(vidpid):
+    for name, found in mouse_ids().items():
+        if found == vidpid:
+            return name
+    return vidpid
+
+
+def list_mice():
+    return [name for name, _sysfs in _mouse_chunks()]
+
+
+def helper_supports_keyd():
+    """线上那份 root 助手是不是已经会处理 keyd 分支。
+
+    升级期一定会出现“GUI 新、助手旧”的组合：旧助手只吃 3 个参数，
+    把 keyd 的 INI 当 xremap 的 YAML 写下去，后果是服务起不来。
+    读不到文件时保守返回 True（让助手自己判），读到但没有分支就明确拒绝。
+    """
+    try:
+        with open(APPLY_HELPER, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return True
+    return "apply_keyd" in text
 
 
 def load_validator():
@@ -315,9 +579,9 @@ def run_in_thread(argv, callback, timeout=180):
     threading.Thread(target=work, daemon=True).start()
 
 
-def poll_service(callback):
+def poll_service(callback, unit=UNIT):
     run_in_thread(
-        ["systemctl", "show", UNIT, "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
+        ["systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
         lambda rc, out, err: callback(dict(
             line.split("=", 1) for line in out.splitlines() if "=" in line
         )),
@@ -331,8 +595,10 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self.set_default_size(580, 760)
         self.busy = False
         self.validate_fn, self.semantic_fn = load_validator()
-        bindings, device, hold_timeout = read_current()
+        bindings, device, hold_timeout, backend, auto_release = read_current()
         self.hold_timeout = hold_timeout if isinstance(hold_timeout, int) else HOLD_TIMEOUT_DEFAULT
+        self.backend = backend if backend in dict(BACKENDS) else XREMAP_BACKEND
+        self.auto_release = bool(auto_release)
 
         self.header = Adw.HeaderBar()
         self.title_widget = Adw.WindowTitle(title="侧键映射", subtitle="")
@@ -371,6 +637,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
         rows_box.set_margin_end(12)
 
         self.rows = {}
+        self.double_rows = []
         for code, cn in BUTTONS:
             group = Adw.PreferencesGroup(title=f"{cn}（{code}）")
             for kind, gn in GESTURES:
@@ -387,7 +654,38 @@ class SideKeysWindow(Adw.ApplicationWindow):
                 group.add(entry)
 
                 self.rows[(code, kind)] = (combo, entry, labels)
+                if kind == "double":
+                    self.double_rows.append((code, combo, entry))
             rows_box.append(group)
+
+        # 后端引擎：两个引擎都要 EVIOCGRAB 这只鼠标，只能二选一运行。
+        engine_group = Adw.PreferencesGroup(
+            title="后端引擎",
+            description="决定“长按”在什么时候发出，以及能不能用“双击”",
+        )
+        self.backend_row = Adw.ComboRow(
+            title="引擎",
+            subtitle="切换只会改变生成的配置与运行的服务，应用后才生效",
+        )
+        self.backend_row.set_model(Gtk.StringList.new([label for _n, label in BACKENDS]))
+        self.backend_row.set_selected([name for name, _l in BACKENDS].index(self.backend))
+        self.backend_row.connect("notify::selected", self._on_backend)
+        engine_group.add(self.backend_row)
+
+        self.auto_release_row = Adw.SwitchRow(
+            title="长按自动释放",
+            subtitle="开：按住到阈值只发一次（实测关掉内核 repeat，按住 1 秒不再等于 24 个回车）；"
+                     "关：按住多久就重复多久",
+        )
+        self.auto_release_row.set_active(self.auto_release)
+        self.auto_release_row.connect("notify::active", lambda *_: self._update_preview())
+        engine_group.add(self.auto_release_row)
+
+        engine_group.add(Adw.ActionRow(
+            title="keyd 没有双击算子",
+            subtitle="选 keyd 时“双击”那一栏会被隐藏并从配置里去掉；实测长按比松手早 956ms 发出",
+        ))
+        rows_box.append(engine_group)
 
         # 长按阈值：xremap 的 held 对鼠标键只能在松手时判定（鼠标键不发 repeat 事件），
         # 所以能调的只有“按住多久才算长按”。上游默认 1000ms，慢到没人会按住一秒再松手。
@@ -407,6 +705,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
             adjustment=self.hold_adjustment,
         )
         self.hold_row.connect("notify::value", lambda *_: self._update_preview())
+        self.hold_group = hold_group
         hold_group.add(self.hold_row)
         rows_box.append(hold_group)
 
@@ -467,6 +766,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self._populate_devices(device)
         for code, kind in [(c, k) for c, _ in BUTTONS for k, _ in GESTURES]:
             self._sync_custom_visibility(code, kind)
+        self._apply_backend_visibility()
         self._update_preview()
         self._refresh_status()
         GLib.timeout_add_seconds(5, self._refresh_status)
@@ -507,6 +807,29 @@ class SideKeysWindow(Adw.ApplicationWindow):
         self._sync_custom_visibility(code, kind)
         self._update_preview()
 
+    def _selected_backend(self):
+        label = self.backend_row.get_selected_item().get_string()
+        return BACKEND_BY_LABEL.get(label, XREMAP_BACKEND)
+
+    def _on_backend(self, *_):
+        self.backend = self._selected_backend()
+        self._apply_backend_visibility()
+        self._update_preview()
+        self._refresh_status()
+
+    def _apply_backend_visibility(self):
+        keyd = self.backend == KEYD_BACKEND
+        for code, combo, entry in self.double_rows:
+            combo.set_visible(not keyd)
+            entry.set_visible(False)
+            # 自定义输入行的可见性归 _sync_custom_visibility 管，切回来要按原规则恢复
+            self._sync_custom_visibility(code, "double")
+        self.auto_release_row.set_visible(keyd)
+        self.hold_group.set_description(
+            "长按的动作在按住达到阈值时立即发出，不等松手（实测比物理松手早 956ms）；不足阈值算点按"
+            if keyd else "长按的动作在松手那一刻发出；按住不足阈值会算成点按"
+        )
+
     def current_bindings(self):
         out = {}
         for code, _ in BUTTONS:
@@ -521,6 +844,9 @@ class SideKeysWindow(Adw.ApplicationWindow):
                 else:
                     token = TOKEN_BY_LABEL[label]
                 out[code][kind] = token
+            if self.backend == KEYD_BACKEND:
+                # keyd 没有双击算子；留着旧值会让生成器直接报错，读起来像界面坏了
+                out[code]["double"] = None
         return out
 
     def _describe(self, bindings):
@@ -538,15 +864,20 @@ class SideKeysWindow(Adw.ApplicationWindow):
     def _update_preview(self):
         bindings = self.current_bindings()
         try:
-            payload = dump_yaml(bindings, self._selected_device(), self.hold_row.get_value())
+            payload = dump_config(self.backend, bindings, self._selected_device(),
+                                    self.hold_row.get_value(), self.auto_release_row.get_active())
         except ValueError as exc:
             self.title_widget.set_subtitle(f"写法有误：{exc}")
             return
         self.preview_text.get_buffer().set_text(payload)
         self.title_widget.set_subtitle(self._describe(bindings))
 
+    def _status_unit(self):
+        # keyd 后端跑的是它自己的单元；报错了单元就等于在骗用户
+        return KEYD_UNIT if self.backend == KEYD_BACKEND else XREMAP_UNIT
+
     def _refresh_status(self):
-        poll_service(self._on_status)
+        poll_service(self._on_status, self._status_unit())
         return True
 
     def _on_status(self, props):
@@ -554,7 +885,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
         if state == "active":
             self.banner.set_revealed(False)
         else:
-            self.banner.set_title(f"{UNIT} 未在运行（{state}，历史重启 {props.get('NRestarts', '?')} 次）")
+            self.banner.set_title(f"{self._status_unit()} 未在运行（{state}，历史重启 {props.get('NRestarts', '?')} 次）")
             self.banner.set_button_label("启动服务")
             self.banner.set_revealed(True)
 
@@ -592,12 +923,19 @@ class SideKeysWindow(Adw.ApplicationWindow):
         if not device:
             self._toast("没有可选的鼠标设备。本工具刻意只接管单个设备，不去抓全部键盘", error=True)
             return
+        if self.backend == KEYD_BACKEND and not helper_supports_keyd():
+            self._toast(f"{APPLY_HELPER} 还是旧版，不认识 keyd 后端；请重跑 sudo ./install.sh 更新 root 侧",
+                        error=True)
+            return
         try:
-            payload = dump_yaml(bindings, device, self.hold_row.get_value())
+            payload = dump_config(self.backend, bindings, device,
+                                  self.hold_row.get_value(), self.auto_release_row.get_active())
         except ValueError as exc:
             self._toast(str(exc), error=True)
             return
-        if "BTN_SIDE" not in payload and "BTN_EXTRA" not in payload:
+        # 两个后端的不同写法都要能认出“确实绑了某个侧键”，否则误判成空配置会写坏线上映射
+        markers = ("BTN_SIDE", "BTN_EXTRA") if self.backend == XREMAP_BACKEND else tuple(KEYD_BUTTON.values())
+        if not any(m in payload for m in markers):
             self._toast("生成的配置里没有任何侧键绑定，已中止", error=True)
             return
         try:
@@ -614,7 +952,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
             if errs:
                 self._toast("校验未通过：" + errs[0], error=True)
                 return
-        self._dispatch(["apply", STAGE_PATH, device], "已生效")
+        self._dispatch(["apply", STAGE_PATH, device, self.backend], "已生效")
 
     def _dispatch(self, args, ok_message):
         if self.busy:
@@ -644,9 +982,9 @@ class SideKeysWindow(Adw.ApplicationWindow):
 
 
 def cli_mode(argv):
-    bindings, device, hold_timeout = read_current()
+    bindings, device, hold_timeout, backend, auto_release = read_current()
     if argv[0] == "--print":
-        sys.stdout.write(dump_yaml(bindings, device, hold_timeout))
+        sys.stdout.write(dump_config(backend, bindings, device, hold_timeout, auto_release))
         return 0
     if argv[0] == "--mice":
         print("\n".join(list_mice()))

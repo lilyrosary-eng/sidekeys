@@ -88,9 +88,32 @@ sudo ./uninstall.sh --purge
   想要“粘贴后回车”，请把它拆成两个手势（例如双击 = 回车）。
 - 预设 15 项（复制、粘贴、剪切、复制/粘贴的终端可用变体、回车/执行、新开标签页、关闭标签页、后退/前进、刷新、下一个/上一个窗口、锁屏、屏蔽、自定义）；选“自定义…”出现输入行，可写任意 xremap 写法，宏用逗号分隔（`C-c, Enter`）。
 - **设备下拉**来自 `/proc/bus/input/devices`（不需要权限），并过滤虚拟设备——包括 xremap 自己创建的输出设备，映射它会形成回环。
-- **只读 YAML 预览** + 标题栏实时摘要；服务掉线时横幅一键启动。
+- **只读预览**（按后端显示 YAML 或 INI）+ 标题栏实时摘要；服务掉线时横幅一键启动。
 
 点“应用”之后依次发生：`xremap --validate-config` → 本项目自己的键名/语义校验 → 备份 → 写入 → 重启 → 健康检查（失败自动回滚）。
+
+### 后端引擎：xremap 与 keyd
+
+界面里的「后端引擎」下拉切换两套配置格式与两个服务单元，**同一时刻只运行其中一个**
+（两者都用 `EVIOCGRAB` 独占同一只鼠标，同时跑就是其中一个静默收不到事件）。
+
+| | xremap（默认） | keyd（可选，`sudo apt install keyd`） |
+|---|---|---|
+| 配置文件 | `/etc/xremap/config.yml`（YAML） | `/etc/keyd/sidekeys.conf`（INI） |
+| 服务单元 | `sidekeys.service` | `keyd.service` |
+| 长按发出的时刻 | **松手那一刻** | **按住达到阈值时立即发**（实测比松手早 956ms） |
+| 双击手势 | 有（`experimental_map` 的 `double:`） | **没有** |
+| 接管范围 | 服务参数 `--device "<设备名>"` | 配置内 `[ids]` 的 vid:pid |
+
+为什么 xremap 的长按只能在松手时发：`modmap` 的多用途键要进入“已按下 hold”状态
+唯一靠 repeat 事件，而鼠标按键不发 repeat（上游在 `event_handler.rs` 里就是这么注释的），
+`Event::Tick` 计时器又被 event handler 显式忽略。所以这不是配置问题，是它的结构。
+
+选 keyd 时值得同时打开「长按自动释放」：长按动作直接绑 `enter` 会在按住期间被内核重复
+（实测 251ms 首发、之后每约 34ms 一次 —— 按住 1 秒 ≈ 24 个回车）；
+打开后本工具把它包成 `macro2(0, 0, enter)`，只发一次（man：timeout 取 0 即关闭宏重复）。
+写法在两个后端之间自动翻译：`Super/Win → M-`、宏序列 `→ macro(a b)`、`[] → noop`；
+keyd 的键名以 `/usr/bin/keyd.rvaiya list-keys` 为准，校验器不认识的一律拒写。
 
 ### 为什么要自带校验器
 
@@ -108,7 +131,7 @@ GUI 与 root 助手共用同一个校验器，界面当场拦下、助手再兜�
 `--desktop=none`，因此 `application:` 规则不会命中；要按应用区分，需要装
 [xremap-gnome](https://extensions.gnome.org/extension/5060/xremap/) 扩展并把 unit 改成 `--desktop=gnome`。
 
-### 终端里 Ctrl+C 不管用——这是正确的，不是 bug
+### xremap 写法速查（仅 xremap 后端）
 
 可用的写法（摘自 xremap 的 `doc/reference_actions.md` 与 `example/config.yml`）：
 

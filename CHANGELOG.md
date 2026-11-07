@@ -13,6 +13,53 @@
   收集完数据后崩掉，自动退到 `/tmp/input-probe-<uid>.log` 并在终端提示。
 - 窗口期开场白不再自带“每个键按 2 次”的节奏指示——它会覆盖调用方自己印的按键表。
 
+## 0.3.0 — 2026-11-07
+
+### 新增
+
+- **keyd 后端**（界面里多一个「后端引擎」下拉）。存在的理由只有一个：xremap 的 `modmap` 对鼠标键
+  只能在**松手时**发出长按动作，而 keyd 的定时器在它自己的事件循环里，实测长按比物理松手早
+  **956ms** 就发出了。选 keyd 时生成的不再是 YAML 而是 INI：
+
+  ```ini
+  [ids]
+
+  3151:3022
+
+  [main]
+
+  mouse1 = timeout(C-insert, 300, macro2(0, 0, enter))
+  ```
+
+- **「长按自动释放」开关**（keyd 后端）：开=长按动作包成 `macro2(0, 0, …)`，只发一次；
+  关=裸键名，按住期间由内核重复（实测 251ms 首发、之后每约 34ms 一次，按住 1 秒 ≈ 24 个回车）。
+- 写法在两个后端之间自动翻译并保证读回一致：`Super/Win → M-`、`宏序列 → macro(a b)`、
+  `屏蔽 → noop`、组合 → `C-x` 形式；keyd 的键名直接问 `/usr/bin/keyd.rvaiya list-keys`。
+
+### 变更
+
+- **选 keyd 时“双击”那一栏被隐藏，且不会残留进配置**：keyd 没有双击算子
+  （man 里“按两次”只指 layer toggle）。这是本版本明确的取舍。
+- `sidekeys-apply` 现在按后端分叉，并且**保证只有一个引擎在跑**：xremap 与 keyd 都用
+  `EVIOCGRAB` 独占同一只鼠标，两个都启动时后启动的那个一个事件都读不到，而且不报错。
+  切到 keyd 会 `disable --now sidekeys`，切回 xremap 会 `disable --now keyd`。
+  keyd 启动后额外查一次 journal 里的 `ERROR: line`——它对坏配置的态度是
+  “打印错误然后继续跑”，服务 active 不代表配置生效，查到就回滚。
+- `start`/`stop`/`restore` 按“谁在跑”决定作用在哪个单元；`uninstall.sh` 只有在
+  `/etc/keyd/sidekeys.conf` 存在（即本工具确实接管过 keyd）时才停用它，不顺手 disable
+  别人为自己键盘装的 keyd。
+- 服务状态横幅按当前后端显示对应单元名（原来永远报 `sidekeys`，选 keyd 时会误报）。
+
+### 前提与代价
+
+- keyd 需要单独安装：`sudo apt install keyd`（Ubuntu resolute/universe 里是 2.5.0-5，
+  可执行文件叫 `/usr/bin/keyd.rvaiya`）。本项目不打包它。
+- `apt install keyd` / `kanata` 会**自动 enable 并启动**它们的 unit；`install.sh` 之后
+  请注意 `journalctl -u keyd`，本工具的 apply 流程会显式接管这个单元。
+- keyd 的 man 自陈鼠标支持“experimental”，且 `[ids]` 按 vid:pid 前缀匹配会带走该设备的
+  全部接口（实测这只无线接收器的 Mouse / Consumer Control / kbd 三个接口都被接管，
+  光标与笔记本键盘、触摸板均正常）。
+
 ## 0.2.5 — 2026-11-07
 
 ### 新增

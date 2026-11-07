@@ -35,7 +35,7 @@ def buf_text(view):
         return buf.get_text(start, end, False)
 
 
-bindings, device, hold_timeout = sk.read_current()
+bindings, device, hold_timeout, backend, auto_release = sk.read_current()
 hold_ms = hold_timeout if isinstance(hold_timeout, int) else sk.HOLD_TIMEOUT_DEFAULT
 app = Adw.Application(application_id="com.andeyunhui.sidekeys.test")
 win = None
@@ -54,7 +54,9 @@ def inspect_():
     entries = [w for w in widgets if isinstance(w, Adw.EntryRow)]
 
     check("窗口创建且进入渲染", win.get_mapped() or win.get_realized(), f"控件数={len(widgets)}")
-    check("每个侧键三个手势 + 设备 = 7 个下拉", len(combos) == len(sk.BUTTONS) * len(sk.GESTURES) + 1, f"实际={len(combos)}")
+    # 2×3 手势 + 设备 + 后端引擎
+    check("每个侧键三个手势 + 设备 + 后端 = 8 个下拉",
+          len(combos) == len(sk.BUTTONS) * len(sk.GESTURES) + 2, f"实际={len(combos)}")
     check("每个绑定点一个自定义输入行", len(entries) == len(sk.BUTTONS) * len(sk.GESTURES), f"实际={len(entries)}")
 
     titles = [w.get_title() for w in widgets if isinstance(w, Adw.PreferencesGroup)]
@@ -76,7 +78,8 @@ def inspect_():
     ph = win.preview_scroll.get_height()
     _m, nh, _p, _n = win.preview_scroll.measure(Gtk.Orientation.VERTICAL, -1)
     check(f"预览框实际高度不被压扁（实测 {ph}px，自然高度 {nh}px）", ph >= 160, f"ph={ph} nh={nh}")
-    check("预览与生成器一致", text == sk.dump_yaml(bindings, device, hold_ms), text.replace("\n", "\\n")[:70])
+    check("预览与生成器一致", text == sk.dump_config(backend, bindings, device, hold_ms, auto_release),
+          text.replace("\n", "\\n")[:70])
     check("预览含侧键码", "BTN_SIDE" in text and "BTN_EXTRA" in text)
 
     # 长按阈值控件：初始值等于线上配置（没有则用工具默认值），改动要立刻反映到预览
@@ -151,6 +154,27 @@ def inspect_():
     win._check_stale()
     check("指纹一致时横幅收起", not win.stale_banner.get_revealed())
     win._dispatch = real_dispatch
+
+    # 后端切换的界面联动：keyd 下双击不可见、自动释放出现、预览换成 INI
+    backend_labels = [lb for _n, lb in sk.BACKENDS]
+    win.backend_row.set_selected(backend_labels.index(sk.KEYD_LABEL))
+    check("选 keyd 后双击行被隐藏",
+          all(not c.get_visible() for _code, c, _e in win.double_rows),
+          str([c.get_visible() for _code, c, _e in win.double_rows]))
+    check("选 keyd 后自动释放开关可见", win.auto_release_row.get_visible())
+    ini = buf_text(preview)
+    check("选 keyd 后预览是 INI（[ids] 与 mouse1）", "[ids]" in ini and "mouse1" in ini, ini[:90])
+    check("keyd 预览里不再有 BTN_ / experimental_map",
+          "BTN_" not in ini and "experimental_map" not in ini, ini[-120:])
+    check("keyd 的长按判定说明改成“到点即发”", "不等松手" in win.hold_group.get_description(),
+          win.hold_group.get_description())
+    win.backend_row.set_selected(backend_labels.index(sk.XREMAP_LABEL))
+    check("切回 xremap 后双击行恢复可见",
+          all(c.get_visible() for _code, c, _e in win.double_rows),
+          str([c.get_visible() for _code, c, _e in win.double_rows]))
+    check("切回 xremap 后自动释放开关隐藏", not win.auto_release_row.get_visible())
+    check("切回 xremap 后预览回到 YAML", "keymap" in buf_text(preview) or "modmap" in buf_text(preview),
+          buf_text(preview)[:70])
 
     # 回归：窗口被压矮时，预览框不能被挤扁（这就是线上“框非常矮”的那个 bug）
     win.set_size_request(-1, 480)
