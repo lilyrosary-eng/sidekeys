@@ -1,7 +1,26 @@
 # Third-party notices / 第三方声明
 
-本仓库自身代码（`src/`、`tools/`、`tests/`、`data/`）由作者原创编写。下面逐文件说明**依赖**与**改写来源**，
+本仓库自身代码（`src/`、`tools/`、`tests/`、`data/`、`contrib/` 除注明片段、`packaging/`、`build_deb.sh`、`install.sh`、`uninstall.sh`）由作者原创编写。下面逐文件说明**依赖**与**改写来源**，
 以便任何再分发都能满足各自的许可条件。
+
+## keyd — MIT/X Consortium License
+
+- **运行时依赖，不随本仓库分发。** 后端选 keyd 时由 `keyd.service` 运行 `/usr/bin/keyd.rvaiya`；
+  用户自行安装（Ubuntu: `apt install keyd`，2.5.0-5）。许可与版权归上游
+  （`LICENSE` 原文为 "MIT/X Consortium License"，© 2020 Raheman Vaiya）。
+- 本仓库**不含任何来自 keyd 的源代码**。与 keyd 有关的只有三处“我们自己写的配置/说明”：
+  `contrib/10-keyd-exclusivity.conf`（给 keyd 单元加的 systemd drop-in）、
+  `src/sidekeys.py` 里生成 `[ids]/[main]` 配置的函数、以及注释与文档中对其
+  源码位置的引用（如 `src/keyboard.c:1064`、`src/device.c` 的 BTN_SIDE→mouse1 映射）。
+  引用的是**事实性出处**（文件与行号），没有复制其代码正文。
+- 关键结论的来源已注明是读上游源码得出：长按“到点即发”依赖 keyd 自己的
+  `poll(..., timeout)` + `EV_TIMEOUT` 机制。若上游改掉该机制，本项目的生成器需要跟着改。
+
+## kanata（评估过，未采用）
+
+- 只在本仓库的文档与注释里作为**对比结论**出现，不构成分发或链接；未打包任何 kanata 代码。
+- 结论记录在 CHANGELOG/README：apt 里的 kanata 1.9.0 没有 `multi-tap`（实测 `--check` 报
+  `Unknown action type`），设备限定只认 `linux-dev <精确节点路径>`，因此没有采用它做后端。
 
 ## xremap — MIT
 
