@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 把本地提交增量发布到远端 main：以远端 tree 为 base，父提交用远端 main 的 sha。
-# 用于 github.com 的 git 端点不可达、只能走 api.github.com 的情况。
+# 备用通道：只在 github.com 的 git 端点不可达时用（本项目早期长期 502，所以一直走这里）。
+# 2026-11-08 起 git 端点可达、本地历史也已与远端对齐，日常请直接用 git push；
+# 这个脚本留着应急，它的好处是逐 blob/逐 tree 校验，坏处是产生的 sha 与本地不同。
 #
 #   ./publish_via_api.sh            # 只发布 HEAD（要求其父 tree 与远端 tree 一致）
 #   ./publish_via_api.sh 03b42d8    # 依序发布 03b42d8..HEAD 之间的每一个提交，保留各自提交信息

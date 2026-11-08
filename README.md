@@ -262,14 +262,19 @@ pkexec tools/input-probe 40     # 同时看 evdev 全部事件类型与 /dev/hid
 ```
 src/sidekeys.py                     GTK4/libadwaita GUI
 src/sidekeys-apply                  pkexec 侧助手（校验/备份/写入/重启/回滚）
-src/sidekeys_validate.py            键名与语义校验器（GUI 与助手共用，装到 /usr/local/lib/sidekeys）
+src/sidekeys_validate.py            键名与语义校验器（GUI 与助手共用，装到 /usr/lib/sidekeys）
 data/com.andeyunhui.sidekeys.desktop.in  桌面入口模板（install.sh 替换 @BINDIR@）
 data/org.andeyunhui.sidekeys.policy polkit 动作
 contrib/sidekeys.service            systemd 单元（改写自 xremap 文档，见署名）
 contrib/sidekeys-run                服务真实入口，替 systemd 补足引号语义
 contrib/99-sidekeys-uinput.rules    uinput 权限规则
+contrib/10-keyd-exclusivity.conf    给 keyd 单元的反向互斥 drop-in
+packaging/                          deb 的 control 与 postinst/prerm/postrm
+build_deb.sh                        组 .deb（dpkg-deb，不需要 debhelper）
+publish_via_api.sh                  走 API 的备用发布通道
 tools/                              输入诊断
 tests/                              自动化验证
+.gitattributes                      文本一律 LF（Windows/Linux 共用工作区）
 ```
 
 跑测试：
@@ -284,6 +289,22 @@ python3 tests/e2e_three_gestures.py  # 真跑 apply 三手势 + 撤销（会弹 
 
 它断言：分组标题齐全、下拉初值等于线上配置、设备列表不含 xremap 的虚拟输出设备、
 “自定义”联动输入行可见性与预览内容、屏蔽写法生成空序列 `[]` 等。
+
+## 跨平台开发与发布
+
+仓库放在 Windows 与 Linux 共用的 NTFS 分区上（Linux 侧 `/mnt/win_d/新建文件夹/Linuxprojects/sidekeys`，
+Windows 侧 `D:\新建文件夹\Linuxprojects\sidekeys`）。该 ntfs3 挂载带 `acl`，实测 `chmod 0755`
+能持久化、符号链接可用、大小写敏感，所以 git 的执行位不会丢。
+
+- **换行符**：`.gitattributes` 把文本钉成 LF。别在 Windows 上把它们存成 CRLF ——
+  shell 脚本、systemd 单元、polkit 策略带上 `\r` 会直接起不来。
+- **日常同步**：正常 `git pull` / `git push` 即可（2026-11-08 起 git 端点可达，
+  且本地历史已与远端对齐）。`publish_via_api.sh` 保留为**备用通道**，
+  只在 git 端点又不通时用；它按提交增量发布并逐 blob/tree 校验。
+- **打包**：`./build_deb.sh` 只能在 Linux 侧跑（依赖 `dpkg-deb`）。产物在 `dist/`（已 gitignore）。
+- **发版**：打附注标签 → `gh release create` → `gh release upload <deb>` →
+  再 `gh release download` 回读并 `cmp`，确认资产与本地逐字节一致。
+- Windows 侧要跑 `.sh` 需要 Git Bash 或 WSL；AHK 后端（规划中）不依赖这些脚本。
 
 ## 许可
 
