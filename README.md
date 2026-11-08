@@ -278,6 +278,7 @@ tests/                              自动化验证
 python3 tests/verify_validate.py     # 纯逻辑：校验器不误杀/能拦住、配置生成形状、round-trip（无需 GUI）
 python3 tests/verify_ui.py           # 遍历真实控件树的结构与联动（需要 GUI 会话）
 python3 tests/verify_apply_path.py   # 应用前的校验与参数传递，不触发授权、不改线上配置
+bash tests/verify_helper.sh         # root 助手静态回归：必须真的重载配置，不能只报 active
 python3 tests/e2e_three_gestures.py  # 真跑 apply 三手势 + 撤销（会弹 polkit，短暂改变你的映射）
 ```
 

@@ -54,6 +54,25 @@ wait_active() { # $1=unit
 
 logs() { journalctl -u "$1" -n 12 --no-pager 2>&1 | tail -12; }
 
+# 让引擎真正加载磁盘上的新配置。
+# 关键坑（线上踩过）：`systemctl enable --now` 对**已经在运行**的单元是空操作，
+# 于是配置写进磁盘了、进程还在用旧映射 —— 用户看到的是“改了 C-a 却仍然发回车”。
+# keyd 自己不监听配置文件（2.5.0 源码里没有 inotify），xremap 同理，所以必须 restart。
+bring_up() { # $1=unit
+    systemctl enable "$1" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$1"; then
+        systemctl restart "$1"
+    else
+        systemctl start "$1"
+    fi
+}
+
+# keyd 每次加载配置都会打一行 "CONFIG: parsing"。用它做“真的重载了”的运行时证据，
+# 而不是只看服务 active —— active 恰恰是这次骗过我们的那个状态。
+keyd_parse_count() {
+    journalctl -u "$KEYD_UNIT" --no-pager 2>/dev/null | grep -c "CONFIG: parsing" || true
+}
+
 apply_xremap() { # $1=stage $2=device
     [ -x "$XREMAP" ] || die "没找到 $XREMAP：先安装 xremap（见 README）"
     if ! out=$("$XREMAP" --validate-config "$1" 2>&1); then
@@ -93,15 +112,28 @@ apply_keyd() { # $1=stage
     systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
 
     systemctl daemon-reload
-    if ! systemctl enable --now "$KEYD_UNIT" >/dev/null 2>&1 || ! wait_active "$KEYD_UNIT"; then
+    parses_before=$(keyd_parse_count)
+    if ! bring_up "$KEYD_UNIT" || ! wait_active "$KEYD_UNIT"; then
         state=$(systemctl is-active "$KEYD_UNIT" || true)
-        [ -f "$KEYD_BACKUP" ] && { cp -a "$KEYD_BACKUP" "$KEYD_CONF"; systemctl restart "$KEYD_UNIT" || true; }
+        if [ -f "$KEYD_BACKUP" ]; then
+            cp -a "$KEYD_BACKUP" "$KEYD_CONF"
+            systemctl restart "$KEYD_UNIT" || true
+        fi
         die "$KEYD_UNIT 启动失败（$state），已回滚。最近日志：
+$(logs "$KEYD_UNIT")"
+    fi
+    sleep 1
+    parses_after=$(keyd_parse_count)
+    if [ "${parses_after:-0}" -le "${parses_before:-0}" ]; then
+        if [ -f "$KEYD_BACKUP" ]; then
+            cp -a "$KEYD_BACKUP" "$KEYD_CONF"
+            systemctl restart "$KEYD_UNIT" || true
+        fi
+        die "keyd 没有重新解析配置（写盘成功但进程仍在用旧映射），已回滚。最近日志：
 $(logs "$KEYD_UNIT")"
     fi
     # keyd 报配置错误是 `ERROR: line <n>: ...`，而且它带着坏配置继续跑；
     # 服务 active ≠ 配置生效，所以这里单独查一遍，有 ERROR 就回滚。
-    sleep 1
     errs=$(journalctl -u "$KEYD_UNIT" --since "-8 seconds" --no-pager 2>&1 | grep -E "ERROR: line" || true)
     if [ -n "$errs" ]; then
         if [ -f "$KEYD_BACKUP" ]; then
@@ -111,7 +143,7 @@ $(logs "$KEYD_UNIT")"
         die "keyd 拒绝这份配置（已回滚到上一版）：
 $errs"
     fi
-    echo "已生效（后端 keyd，单元 $KEYD_UNIT $(systemctl is-active "$KEYD_UNIT")；接管范围见配置里的 [ids]）"
+    echo "已生效（后端 keyd，单元 $KEYD_UNIT $(systemctl is-active "$KEYD_UNIT")；已确认重新解析配置 $parses_before→$parses_after 次；接管范围见 [ids]）"
 }
 
 validate_stage() { # $1=stage
@@ -175,13 +207,13 @@ case "${1:-}" in
         if [ "$backend" = keyd ]; then
             [ -s "$KEYD_CONF" ] || die "$KEYD_CONF 不存在或为空：请在界面里选 keyd 后端后点“应用”"
             systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
-            systemctl enable --now "$KEYD_UNIT"
+            bring_up "$KEYD_UNIT"
             wait_active "$KEYD_UNIT" || die "启动失败：$(logs "$KEYD_UNIT")"
             echo "服务已启动（$KEYD_UNIT；$UNIT 已停用，避免两个引擎抢同一只鼠标）"
         else
             [ -s "$CONF" ] || die "$CONF 不存在或为空：请在界面里点“应用”写入配置"
             systemctl disable --now "$KEYD_UNIT" >/dev/null 2>&1 || true
-            systemctl enable --now "$UNIT"
+            bring_up "$UNIT"
             wait_active "$UNIT" || die "启动失败：$(logs "$UNIT")"
             echo "服务已启动（$UNIT；$KEYD_UNIT 已停用）"
         fi
