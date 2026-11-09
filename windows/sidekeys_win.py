@@ -45,6 +45,10 @@ WM_XBUTTONUP = 0x020C
 HC_ACTION = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
+# 这些键在物理键盘上是扩展键(E0 前缀),控制台等应用靠该标志区分小键盘区
+EXTENDED_KEYS = {0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28,
+                 0x5B, 0x5C, 0x5D, 0x2C, 0x90, 0x6F}
 NIM_ADD = 0
 NIM_DELETE = 2
 NIF_MESSAGE = 1
@@ -80,10 +84,13 @@ TOKEN_BY_LABEL = dict(PRESETS)
 LABEL_BY_TOKEN = {v: k for k, v in PRESETS if v is not None}
 CUSTOM_LABEL = PRESETS[-1][0]
 BUTTONS = [("xbutton1", "后侧键"), ("xbutton2", "前侧键")]
+BOTH = ("both", "双键(一起按)")
+ALL_BUTTONS = BUTTONS + [BOTH]
 GESTURES = [("tap", "点按"), ("hold", "长按"), ("double", "双击")]
 DEFAULTS = {
     "xbutton1": {"tap": "C-c", "hold": None, "double": None},
     "xbutton2": {"tap": "C-v", "hold": None, "double": None},
+    "both": {"tap": None, "hold": None, "double": None},
 }
 
 MODIFIERS = {
@@ -244,6 +251,8 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 
@@ -251,9 +260,11 @@ shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICOND
 def send_combo(vks):
     seq = []
     for vk in vks:
-        seq.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk)))
+        flags = KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_KEYS else 0
+        seq.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
     for vk in reversed(vks):
-        seq.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, dwFlags=KEYEVENTF_KEYUP)))
+        flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_KEYS else 0)
+        seq.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, dwFlags=flags)))
     arr = (INPUT * len(seq))(*seq)
     sent = user32.SendInput(len(seq), arr, ctypes.sizeof(INPUT))
     if sent != len(seq):
@@ -271,6 +282,9 @@ class MouseHook:
         self.mapping = mapping
         self.hold_ms = hold_ms
         self._states = {}
+        self._phys = set()          # 当前物理按下的侧键
+        self._chord_active = False
+        self._chord_members = set()  # 被本次和弦占用、松手时不触发单键动作的键
         self._lock = threading.Lock()
         self._thread = None
         self._tid = None
@@ -282,6 +296,9 @@ class MouseHook:
         with self._lock:
             self._cancel_timers()
             self._states = {}
+            self._phys = set()
+            self._chord_active = False
+            self._chord_members = set()
             self.mapping = mapping
             self.hold_ms = hold_ms
 
@@ -348,20 +365,60 @@ class MouseHook:
         else:
             self._fire(gest.get("tap"))
 
+    @staticmethod
+    def _has_gesture(gest):
+        return bool(gest) and any(gest.get(g) is not None for g, _ in GESTURES)
+
+    def _reset(self, key):
+        st = self._states.get(key)
+        if st:
+            for name in ("hold_timer", "tap_timer"):
+                timer = st.get(name)
+                if timer:
+                    timer.cancel()
+            st.clear()
+
+    def _phys_down(self, button, gest_ind, gest_both):
+        self._phys.add(button)
+        if button in self._chord_members:
+            return
+        if len(self._phys) == 2 and self._has_gesture(gest_both):
+            # 两键齐按:切到双键通道,取消两个单键的待发动作
+            self._chord_active = True
+            self._chord_members = {1, 2}
+            self._reset("xbutton1")
+            self._reset("xbutton2")
+            self._down("both", gest_both)
+        elif not self._chord_active:
+            self._down(f"xbutton{button}", gest_ind)
+
+    def _phys_up(self, button, gest_ind, gest_both):
+        self._phys.discard(button)
+        if button in self._chord_members:
+            self._chord_members.discard(button)
+            if self._chord_active:
+                self._chord_active = False
+                self._up("both", gest_both)
+            return
+        if not self._chord_active:
+            self._up(f"xbutton{button}", gest_ind)
+
     def _run(self):
         def callback(nCode, wParam, lParam):
             if nCode == HC_ACTION and wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP):
                 info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 button = (info.mouseData >> 16) & 0xFFFF
-                key = f"xbutton{button}"
-                gest = self.mapping.get(key)
-                if gest is not None and any(gest.get(g) is not None for g, _ in GESTURES):
-                    with self._lock:
-                        if wParam == WM_XBUTTONDOWN:
-                            self._down(key, gest)
-                        else:
-                            self._up(key, gest)
-                    return 1  # down/up 都吞掉,否则目标应用会看到半个点击
+                if button in (1, 2):
+                    gest_ind = self.mapping.get(f"xbutton{button}") or {}
+                    gest_both = self.mapping.get("both") or {}
+                    # 绑了和弦时两个单键都被"占用"(即使单键没绑),否则一起按会先漏出单键原功能
+                    if self._has_gesture(gest_ind) or self._has_gesture(gest_both):
+                        with self._lock:
+                            if wParam == WM_XBUTTONDOWN:
+                                self._phys_down(button, gest_ind, gest_both)
+                            else:
+                                self._phys_up(button, gest_ind, gest_both)
+                        return 1  # down/up 都吞掉,否则目标应用会看到半个点击
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._proc = HOOKPROC(callback)
@@ -395,6 +452,9 @@ class MouseHook:
         with self._lock:
             self._cancel_timers()
             self._states = {}
+            self._phys = set()
+            self._chord_active = False
+            self._chord_members = set()
 
 
 class TrayIcon:
@@ -404,10 +464,12 @@ class TrayIcon:
     MENU_SHOW = 1
     MENU_TOGGLE = 2
     MENU_QUIT = 3
+    MENU_ELEVATE = 4
 
-    def __init__(self, tip, command_queue, is_running):
+    def __init__(self, tip, command_queue, is_running, can_elevate=False):
         self.command_queue = command_queue
         self.is_running = is_running
+        self.can_elevate = can_elevate
         self.tip = tip
         self._hwnd = None
         self._thread = None
@@ -421,6 +483,8 @@ class TrayIcon:
         user32.AppendMenuW(menu, 0, self.MENU_SHOW, "显示主窗口")
         user32.AppendMenuW(menu, 0, self.MENU_TOGGLE,
                            "停止映射" if self.is_running() else "启用映射")
+        if self.can_elevate:
+            user32.AppendMenuW(menu, 0, self.MENU_ELEVATE, "以管理员身份重启(管理员终端需要)")
         user32.AppendMenuW(menu, 0, self.MENU_QUIT, "退出")
         pt = POINT()
         user32.GetCursorPos(ctypes.byref(pt))
@@ -439,7 +503,7 @@ class TrayIcon:
                 return 0
             if msg == WM_COMMAND:
                 cmd = {self.MENU_SHOW: "show", self.MENU_TOGGLE: "toggle",
-                       self.MENU_QUIT: "quit"}.get(wParam & 0xFFFF)
+                       self.MENU_QUIT: "quit", self.MENU_ELEVATE: "elevate"}.get(wParam & 0xFFFF)
                 if cmd:
                     self.command_queue.put(cmd)
                 return 0
@@ -506,7 +570,7 @@ def load_config():
             ms = data.get("hold_ms")
             if isinstance(ms, int) and HOLD_MS_MIN <= ms <= HOLD_MS_MAX:
                 hold_ms = ms
-            for key, _ in BUTTONS:
+            for key, _ in ALL_BUTTONS:
                 val = data.get(key)
                 if isinstance(val, str):  # 旧版只存点按
                     val = {"tap": val}
@@ -563,6 +627,39 @@ def autostart_enabled():
         return False
 
 
+def is_elevated():
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return False
+    try:
+        elevation = wintypes.DWORD()
+        ret = wintypes.DWORD()
+        if not advapi32.GetTokenInformation(token, 20, ctypes.byref(elevation), 4, ctypes.byref(ret)):
+            return False
+        return bool(elevation.value)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def restart_elevated():
+    """以管理员身份重启自己。成功返回 True;用户取消 UAC 或失败返回 False。"""
+    if getattr(sys, "frozen", False):
+        exe, params = sys.executable, None
+    else:
+        script = os.path.abspath(__file__)
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        exe = pythonw if os.path.exists(pythonw) else sys.executable
+        params = f'"{script}"'
+    shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+    shell32.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                      wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int]
+    return int(shell32.ShellExecuteW(None, "runas", exe, params, None, 1)) > 32
+
+
 # ---------------------------------------------------------------- GUI
 
 class App:
@@ -578,7 +675,7 @@ class App:
 
         tokens, hold_ms = load_config()
         self.rows = {}
-        for i, (key, label) in enumerate(BUTTONS):
+        for i, (key, label) in enumerate(ALL_BUTTONS):
             frame = ttk.LabelFrame(main, text=label, padding=6)
             frame.grid(row=i, column=0, columnspan=3, sticky="w", pady=4)
             for j, (gesture, glabel) in enumerate(GESTURES):
@@ -597,7 +694,7 @@ class App:
                            lambda _e, c=combo, en=entry: self._preset_picked(c, en))
                 self.rows[(key, gesture)] = (combo, entry)
 
-        row = len(BUTTONS)
+        row = len(ALL_BUTTONS)
         ttk.Label(main, text="长按阈值(ms)").grid(row=row, column=0, sticky="w", pady=4)
         self.hold_ms = tk.IntVar(value=hold_ms)
         ttk.Spinbox(main, from_=HOLD_MS_MIN, to=HOLD_MS_MAX, increment=50,
@@ -613,14 +710,17 @@ class App:
 
         self.status = ttk.Label(main, text="未运行", foreground="gray")
         self.status.grid(row=row + 2, column=0, columnspan=3, sticky="w")
-        ttk.Label(main, foreground="gray",
-                  text="提示:关闭窗口收进托盘,映射继续;托盘右键菜单可退出。"
-                  ).grid(row=row + 3, column=0, columnspan=3, sticky="w")
+        hint = "提示:关闭窗口收进托盘,映射继续;托盘右键菜单可退出。"
+        if not is_elevated():
+            hint += "\n管理员身份的终端不生效时,请用托盘菜单「以管理员身份重启」。"
+        ttk.Label(main, foreground="gray", text=hint).grid(
+            row=row + 3, column=0, columnspan=3, sticky="w")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         try:
             self.tray = TrayIcon("sidekeys 侧键映射", self.tray_commands,
-                                 lambda: self.hook is not None)
+                                 lambda: self.hook is not None,
+                                 can_elevate=not is_elevated())
             self.tray.start()
         except OSError as exc:
             self.tray = None
@@ -641,7 +741,7 @@ class App:
             entry.configure(state="disabled")
 
     def _read_tokens(self):
-        tokens = {k: {} for k, _ in BUTTONS}
+        tokens = {k: {} for k, _ in ALL_BUTTONS}
         for (key, gesture), (combo, entry) in self.rows.items():
             if combo.get() == CUSTOM_LABEL:
                 tokens[key][gesture] = entry.get().strip() or None
@@ -698,6 +798,10 @@ class App:
                         self.stop()
                     else:
                         self.apply()
+                elif cmd == "elevate":
+                    if restart_elevated():
+                        self._quit_real()
+                        return
                 elif cmd == "quit":
                     self._quit_real()
                     return
@@ -811,6 +915,44 @@ def selftest():
              hold_press, [0x7E], forbidden=[0x7C])
     run_case("全部不启用则放行(不发任何键)", gestures(), 400, click, [])
 
+    def g(tap=None, hold=None, double=None):
+        return {k: parse_combo(v) for k, v in
+                (("tap", tap), ("hold", hold), ("double", double))}
+
+    def both_down():
+        user32.mouse_event(0x0080, 0, 0, 1, 0)
+        user32.mouse_event(0x0080, 0, 0, 2, 0)
+
+    def both_up():
+        user32.mouse_event(0x0100, 0, 0, 1, 0)
+        user32.mouse_event(0x0100, 0, 0, 2, 0)
+
+    def both_click():
+        both_down()
+        both_up()
+
+    run_case("和弦点按(不触发单键)", {"xbutton1": g(tap="f13"), "xbutton2": g(tap="f13"),
+                                     "both": g(tap="f16")}, 400, both_click,
+             [0x7F], forbidden=[0x7C])
+
+    def both_hold():
+        both_down()
+        pump(0.25)
+        both_up()
+
+    run_case("和弦长按到点即发", {"xbutton1": g(tap="f13"), "both": g(hold="f17")}, 150,
+             both_hold, [0x80], forbidden=[0x7C])
+
+    def both_double():
+        both_click()
+        pump(0.05)
+        both_click()
+
+    run_case("和弦双击", {"both": g(tap="f16", double="f18")}, 400, both_double,
+             [0x81], forbidden=[0x7F])
+    run_case("绑了和弦单键仍独立", {"xbutton1": g(tap="f13"), "both": g(tap="f16")}, 400,
+             click, [0x7C], forbidden=[0x7F])
+
     user32.UnhookWindowsHookEx(kb_hook)
     return 0 if ok else 1
 
@@ -818,6 +960,11 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         return selftest()
+    # 管理员终端需要高权限注入(UIPI)。普通权限启动时自动提权重启一次;
+    # 本机 UAC 静默批准则无感,标准 UAC 机器会弹一次框,取消则退回普通权限运行。
+    if not is_elevated() and "--no-elevate" not in sys.argv:
+        if restart_elevated():
+            return 0
     root = tk.Tk()
     App(root)
     root.mainloop()
