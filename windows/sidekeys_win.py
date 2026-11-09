@@ -538,10 +538,14 @@ def set_autostart(enable):
     import winreg
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
         if enable:
-            script = os.path.abspath(__file__)
-            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-            exe = pythonw if os.path.exists(pythonw) else sys.executable
-            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, f'"{exe}" "{script}"')
+            if getattr(sys, "frozen", False):  # PyInstaller 打包后 exe 即全部,不能再带脚本路径
+                cmd = f'"{sys.executable}"'
+            else:
+                script = os.path.abspath(__file__)
+                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                exe = pythonw if os.path.exists(pythonw) else sys.executable
+                cmd = f'"{exe}" "{script}"'
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, cmd)
         else:
             try:
                 winreg.DeleteValue(key, RUN_VALUE)
