@@ -3,7 +3,7 @@
 ; 按用户安装到 %LOCALAPPDATA%\Programs\sidekeys，不需要管理员权限。
 
 #define MyAppName "sidekeys"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppExeName "sidekeys-win.exe"
 #define MyAppId "{{8E2C7F0A-3B1D-4A6E-9C2F-5D7B1E4A9C63}"
 
@@ -48,7 +48,7 @@ Name: "{autodesktop}\sidekeys"; Filename: "{app}\{#MyAppExeName}"; Tasks: deskto
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
-    ValueName: "sidekeys"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
+    ValueName: "sidekeys"; ValueData: """{app}\{#MyAppExeName}"" --tray"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 sidekeys"; Flags: nowait postinstall skipifsilent

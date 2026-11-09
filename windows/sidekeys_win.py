@@ -641,12 +641,12 @@ def set_autostart(enable):
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
         if enable:
             if getattr(sys, "frozen", False):  # PyInstaller 打包后 exe 即全部,不能再带脚本路径
-                cmd = f'"{sys.executable}"'
+                cmd = f'"{sys.executable}" --tray'
             else:
                 script = os.path.abspath(__file__)
                 pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
                 exe = pythonw if os.path.exists(pythonw) else sys.executable
-                cmd = f'"{exe}" "{script}"'
+                cmd = f'"{exe}" "{script}" --tray'
             winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, cmd)
         else:
             try:
@@ -683,15 +683,15 @@ def is_elevated():
         kernel32.CloseHandle(token)
 
 
-def restart_elevated():
+def restart_elevated(extra_args=None):
     """以管理员身份重启自己。成功返回 True;用户取消 UAC 或失败返回 False。"""
     if getattr(sys, "frozen", False):
-        exe, params = sys.executable, None
+        exe, params = sys.executable, extra_args
     else:
         script = os.path.abspath(__file__)
         pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
         exe = pythonw if os.path.exists(pythonw) else sys.executable
-        params = f'"{script}"'
+        params = f'"{script}"' + (f" {extra_args}" if extra_args else "")
     shell32.ShellExecuteW.restype = wintypes.HINSTANCE
     shell32.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
                                       wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int]
@@ -701,12 +701,14 @@ def restart_elevated():
 # ---------------------------------------------------------------- GUI
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, start_hidden=False):
         self.root = root
         self.hook = None
         self.tray = None
         self.tray_commands = queue.Queue()
         load_user_presets()
+        if start_hidden:
+            root.withdraw()  # 开机自启:只进托盘,不弹窗口
         root.title("sidekeys (Windows)")
         root.resizable(False, False)
         main = ttk.Frame(root, padding=12)
@@ -1064,13 +1066,14 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         return selftest()
+    hidden = "--tray" in sys.argv
     # 管理员终端需要高权限注入(UIPI)。普通权限启动时自动提权重启一次;
     # 本机 UAC 静默批准则无感,标准 UAC 机器会弹一次框,取消则退回普通权限运行。
     if not is_elevated() and "--no-elevate" not in sys.argv:
-        if restart_elevated():
+        if restart_elevated("--tray" if hidden else None):
             return 0
     root = tk.Tk()
-    App(root)
+    App(root, start_hidden=hidden)
     root.mainloop()
     return 0
 
