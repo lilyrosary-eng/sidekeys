@@ -80,9 +80,20 @@ PRESETS = [
     ("不启用(保留原功能)", ""),
     ("自定义…", None),
 ]
-TOKEN_BY_LABEL = dict(PRESETS)
-LABEL_BY_TOKEN = {v: k for k, v in PRESETS if v is not None}
 CUSTOM_LABEL = PRESETS[-1][0]
+USER_PRESETS = []  # [(名称, 映射写法)],从 presets.json 加载,插在下拉框"自定义…"之前
+
+
+def preset_items():
+    return PRESETS[:-1] + USER_PRESETS + [PRESETS[-1]]
+
+
+def token_by_label():
+    return dict(preset_items())
+
+
+def label_by_token():
+    return {v: k for k, v in preset_items() if v is not None}
 BUTTONS = [("xbutton1", "后侧键"), ("xbutton2", "前侧键")]
 BOTH = ("both", "双键(一起按)")
 ALL_BUTTONS = BUTTONS + [BOTH]
@@ -119,6 +130,33 @@ for _i in range(1, 25):
 def config_path():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     return os.path.join(base, "sidekeys", "config.json")
+
+
+def presets_path():
+    return os.path.join(os.path.dirname(config_path()), "presets.json")
+
+
+def load_user_presets():
+    USER_PRESETS.clear()
+    try:
+        with open(presets_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        for item in data:
+            name, token = item.get("name"), item.get("token")
+            if isinstance(name, str) and name and isinstance(token, str) and token:
+                USER_PRESETS.append((name, token))
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def save_user_presets():
+    path = presets_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump([{"name": n, "token": t} for n, t in USER_PRESETS], fh,
+                  ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def parse_combo(text):
@@ -668,6 +706,7 @@ class App:
         self.hook = None
         self.tray = None
         self.tray_commands = queue.Queue()
+        load_user_presets()
         root.title("sidekeys (Windows)")
         root.resizable(False, False)
         main = ttk.Frame(root, padding=12)
@@ -681,12 +720,12 @@ class App:
             for j, (gesture, glabel) in enumerate(GESTURES):
                 ttk.Label(frame, text=glabel).grid(row=j, column=0, sticky="w", pady=2)
                 combo = ttk.Combobox(frame, state="readonly", width=22,
-                                     values=[p[0] for p in PRESETS])
+                                     values=[p[0] for p in preset_items()])
                 combo.grid(row=j, column=1, padx=6)
                 entry = ttk.Entry(frame, width=14)
                 entry.grid(row=j, column=2)
                 token = tokens[key][gesture]
-                combo.set(LABEL_BY_TOKEN.get(token or "", CUSTOM_LABEL))
+                combo.set(label_by_token().get(token or "", CUSTOM_LABEL))
                 entry.insert(0, token or "")
                 if combo.get() != CUSTOM_LABEL:
                     entry.configure(state="disabled")
@@ -704,6 +743,7 @@ class App:
         bar.grid(row=row + 1, column=0, columnspan=3, pady=(10, 4), sticky="w")
         ttk.Button(bar, text="应用", command=self.apply).pack(side="left")
         ttk.Button(bar, text="停止", command=self.stop).pack(side="left", padx=6)
+        ttk.Button(bar, text="添加预设…", command=self._add_preset).pack(side="left", padx=6)
         self.auto_var = tk.BooleanVar(value=autostart_enabled())
         ttk.Checkbutton(bar, text="开机启动", variable=self.auto_var,
                         command=self._toggle_autostart).pack(side="left", padx=6)
@@ -731,7 +771,7 @@ class App:
             self.apply()  # 有保存的配置就直接生效,开机启动时不需要手点
 
     def _preset_picked(self, combo, entry):
-        token = TOKEN_BY_LABEL[combo.get()]
+        token = token_by_label()[combo.get()]
         entry.configure(state="normal")
         entry.delete(0, "end")
         if token is None:
@@ -746,8 +786,72 @@ class App:
             if combo.get() == CUSTOM_LABEL:
                 tokens[key][gesture] = entry.get().strip() or None
             else:
-                tokens[key][gesture] = TOKEN_BY_LABEL[combo.get()] or None
+                tokens[key][gesture] = token_by_label()[combo.get()] or None
         return tokens
+
+    def _refresh_combos(self):
+        values = [p[0] for p in preset_items()]
+        for combo, _entry in self.rows.values():
+            combo["values"] = values
+
+    def _add_preset(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("添加预设")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=12)
+        body.grid(sticky="nsew")
+
+        ttk.Label(body, text="名称").grid(row=0, column=0, sticky="w", pady=4)
+        name_entry = ttk.Entry(body, width=30)
+        name_entry.grid(row=0, column=1, padx=6)
+        ttk.Label(body, text="映射").grid(row=1, column=0, sticky="w", pady=4)
+        map_entry = ttk.Entry(body, width=30)
+        map_entry.grid(row=1, column=1, padx=6)
+        map_entry.insert(0, "C-c")
+
+        ttk.Label(body, foreground="gray", justify="left", wraplength=360,
+                  text="格式：修饰键前缀 C-=Ctrl S-=Shift A-=Alt M-=Win，后接键名。\n"
+                       "范例：C-c 复制 · C-S-t 新标签页 · A-Left 后退 · F5 刷新 · "
+                       "C-Insert 终端复制 · S-Insert 终端粘贴 · [] 屏蔽\n"
+                       "键名：字母/数字、Enter、Esc、Tab、Space、F1–F24、"
+                       "Left/Right/Up/Down、Insert、Delete 等。").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+
+        def save():
+            name = name_entry.get().strip()
+            token = map_entry.get().strip()
+            if not name:
+                messagebox.showerror("缺少名称", "请填写预设名称。", parent=dlg)
+                return
+            if name in token_by_label():
+                messagebox.showerror("名称重复", f"已存在叫「{name}」的预设。", parent=dlg)
+                return
+            try:
+                vks = parse_combo(token)
+            except ValueError as exc:
+                messagebox.showerror("映射写法有误", str(exc), parent=dlg)
+                return
+            if vks is None:
+                messagebox.showerror("映射为空", "映射不能为空;不启用请直接选下拉里的项。", parent=dlg)
+                return
+            USER_PRESETS.append((name, token))
+            try:
+                save_user_presets()
+            except OSError as exc:
+                USER_PRESETS.pop()
+                messagebox.showerror("保存失败", str(exc), parent=dlg)
+                return
+            self._refresh_combos()
+            dlg.destroy()
+
+        ttk.Button(btns, text="保存", command=save).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="left")
+        name_entry.focus_set()
+        dlg.grab_set()
 
     def apply(self):
         tokens = self._read_tokens()
