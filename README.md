@@ -120,6 +120,7 @@ sudo ./uninstall.sh --purge
 - 预设 15 项（复制、粘贴、剪切、复制/粘贴的终端可用变体、回车/执行、新开标签页、关闭标签页、后退/前进、刷新、下一个/上一个窗口、锁屏、屏蔽、自定义）；选“自定义…”出现输入行，可写任意 xremap 写法，宏用逗号分隔（`C-c, Enter`）。
 - **设备下拉**来自 `/proc/bus/input/devices`（不需要权限），并过滤虚拟设备——包括 xremap 自己创建的输出设备，映射它会形成回环。
 - **只读预览**（按后端显示 YAML 或 INI）+ 标题栏实时摘要；服务掉线时横幅一键启动。
+- **自定义预设**：填名称 + 写法即存进 `~/.config/sidekeys/presets.json`，立刻出现在所有下拉框；保存前会用真校验器验一遍写法。JSON 结构与 Windows 版相同。
 
 点“应用”之后依次发生：`xremap --validate-config` → 本项目自己的键名/语义校验 → 备份 → 写入 → 重启 → 健康检查（失败自动回滚）。
 
@@ -282,6 +283,7 @@ tests/                              自动化验证
 ```bash
 python3 tests/verify_validate.py     # 纯逻辑：校验器不误杀/能拦住、配置生成形状、round-trip（无需 GUI）
 python3 tests/verify_ui.py           # 遍历真实控件树的结构与联动（需要 GUI 会话）
+python3 tests/verify_presets.py      # 自定义预设：JSON 容错、校验、保存后进下拉框（用临时 XDG 目录）
 python3 tests/verify_apply_path.py   # 应用前的校验与参数传递，不触发授权、不改线上配置
 bash tests/verify_helper.sh         # root 助手静态回归：必须真的重载配置，不能只报 active
 python3 tests/e2e_three_gestures.py  # 真跑 apply 三手势 + 撤销（会弹 polkit，短暂改变你的映射）

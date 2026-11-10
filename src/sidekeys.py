@@ -7,10 +7,12 @@
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 
 import gi
@@ -67,8 +69,68 @@ PRESETS = [
     ("自定义…", ""),
 ]
 CUSTOM_LABEL = PRESETS[-1][0]
+
+# 用户自定义预设：与 Windows 版同一套 schema（presets.json 里是 [{"name","token"}]），
+# 落地位置按 XDG 习惯放在 ~/.config/sidekeys/。
+USER_PRESETS = []          # [(名称, 写法)]，插在“自定义…”之前
 TOKEN_BY_LABEL = dict(PRESETS)
 LABEL_BY_TOKEN = {v: k for k, v in PRESETS if v}
+
+
+def presets_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "sidekeys", "presets.json")
+
+
+def preset_items():
+    return PRESETS[:-1] + list(USER_PRESETS) + [PRESETS[-1]]
+
+
+def load_user_presets():
+    """读 presets.json。坏文件、坏条目一律跳过：它不该有能力挡住界面启动。"""
+    USER_PRESETS.clear()
+    try:
+        with open(presets_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, list):
+        return
+    builtin = {lb for lb, _tok in PRESETS}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        token = item.get("token")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(token, str) or not token.strip():
+            continue
+        clean_name, clean_token = name.strip(), token.strip()
+        if clean_name in builtin or any(clean_name == n for n, _t in USER_PRESETS):
+            continue
+        USER_PRESETS.append((clean_name, clean_token))
+
+
+def save_user_presets():
+    path = presets_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump([{"name": n, "token": t} for n, t in USER_PRESETS], fh,
+                  ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def rebuild_preset_tables():
+    """把用户预设并进查找表；keyd 的反向表也要重建，否则读回时用户预设会退化成“自定义”。"""
+    global TOKEN_BY_LABEL, LABEL_BY_TOKEN, _KEYD_TO_TOKEN
+    TOKEN_BY_LABEL = dict(preset_items())
+    LABEL_BY_TOKEN = {v: k for k, v in preset_items() if v}
+    if "_KEYD_TO_TOKEN" in globals():
+        _KEYD_TO_TOKEN = {to_keyd_expr(tok): tok for _lb, tok in preset_items() if tok and tok != "[]"}
+        _KEYD_TO_TOKEN[KEYD_NOOP] = "[]"
+
 BUTTONS = [("BTN_SIDE", "后侧键"), ("BTN_EXTRA", "前侧键")]
 GESTURES = [("tap", "点按"), ("hold", "长按"), ("double", "双击")]
 DEFAULT_BINDINGS = {
@@ -292,7 +354,7 @@ def _strip_one_shot(expr):
     return expr, False
 
 
-_KEYD_TO_TOKEN = {to_keyd_expr(tok): tok for _lb, tok in PRESETS if tok and tok != "[]"}
+_KEYD_TO_TOKEN = {to_keyd_expr(tok): tok for _lb, tok in preset_items() if tok and tok != "[]"}
 _KEYD_TO_TOKEN[KEYD_NOOP] = "[]"
 
 
@@ -689,7 +751,7 @@ class SideKeysWindow(Adw.ApplicationWindow):
         for code, cn in BUTTONS:
             group = Adw.PreferencesGroup(title=f"{cn}（{code}）")
             for kind, gn in GESTURES:
-                labels = ([NONE_LABEL] if kind in ("hold", "double") else []) + [lb for lb, _ in PRESETS]
+                labels = ([NONE_LABEL] if kind in ("hold", "double") else []) + [lb for lb, _ in preset_items()]
                 combo = Adw.ComboRow(title=gn)
                 combo.set_model(Gtk.StringList.new(labels))
                 combo.set_selected(self._preset_index(labels, bindings[code].get(kind), kind))
@@ -705,6 +767,24 @@ class SideKeysWindow(Adw.ApplicationWindow):
                 if kind == "double":
                     self.double_rows.append((code, combo, entry))
             rows_box.append(group)
+
+        # 自定义预设：与 Windows 版同一套 presets.json 结构，保存即进所有下拉框
+        preset_group = Adw.PreferencesGroup(
+            title="预设",
+            description="保存后会出现在所有手势的下拉框里，下次启动仍然在",
+        )
+        short_path = presets_path().replace(os.path.expanduser("~"), "~")
+        self.preset_row = Adw.ActionRow(
+            title="自定义预设",
+            subtitle=f"{len(USER_PRESETS)} 个｜{short_path}",
+        )
+        add_preset_btn = Gtk.Button(label="添加…", valign=Gtk.Align.CENTER)
+        add_preset_btn.add_css_class("flat")
+        add_preset_btn.connect("clicked", self._on_add_preset)
+        self.preset_row.add_suffix(add_preset_btn)
+        self.preset_row.set_activatable_widget(add_preset_btn)
+        preset_group.add(self.preset_row)
+        rows_box.append(preset_group)
 
         # 后端引擎：两个引擎都要 EVIOCGRAB 这只鼠标，只能二选一运行。
         engine_group = Adw.PreferencesGroup(
@@ -850,6 +930,113 @@ class SideKeysWindow(Adw.ApplicationWindow):
         entry.set_visible(is_custom)
         if not is_custom:
             entry.set_text("" if combo.get_selected_item().get_string() == NONE_LABEL else TOKEN_BY_LABEL[combo.get_selected_item().get_string()])
+
+    def _preset_problem(self, name, token):
+        """返回一句人话说明哪里不行；None 表示可以保存。用的是真校验器，不是自己再猜一套规则。"""
+        if not name:
+            return "名称不能为空"
+        reserved = {lb for lb, _tok in PRESETS} | {NONE_LABEL}
+        if name in reserved:
+            return "这个名称和内置选项重名了"
+        if any(name == n for n, _tok in USER_PRESETS):
+            return "同名预设已存在"
+        if not token:
+            return "写法不能为空（想屏蔽这个键就写 []）"
+        if not VALID_TOKEN.match(token):
+            return "写法里有不被接受的字符"
+        try:
+            to_keyd_expr(token)
+        except ValueError as exc:
+            return str(exc)
+        probe = {code: {"tap": None, "hold": None, "double": None} for code, _cn in BUTTONS}
+        probe["BTN_SIDE"]["tap"] = token
+        try:
+            payload = dump_config(XREMAP_BACKEND, probe, None)
+        except ValueError as exc:
+            return str(exc)
+        if not self.validate_fn:
+            return None
+        tmp = os.path.join(tempfile.gettempdir(), f"sidekeys-preset-{os.getuid()}.yml")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            errs = self.validate_fn(tmp)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return errs[0] if errs else None
+
+    def _refresh_preset_choices(self):
+        """把新的预设并进每个下拉框，保留当前选择。"""
+        for code, _cn in BUTTONS:
+            for kind, _gn in GESTURES:
+                combo, entry, _old_labels = self.rows[(code, kind)]
+                current = combo.get_selected_item().get_string()
+                labels = ([NONE_LABEL] if kind in ("hold", "double") else []) + \
+                         [lb for lb, _tok in preset_items()]
+                combo.set_model(Gtk.StringList.new(labels))
+                self.rows[(code, kind)] = (combo, entry, labels)
+                combo.set_selected(labels.index(current) if current in labels else labels.index(CUSTOM_LABEL))
+
+    def _on_add_preset(self, _btn):
+        dialog = Adw.Window(transient_for=self, modal=True, title="添加预设")
+        # 必须留一个引用：GTK4 里没人引用的窗口会被回收，表现为“点了添加什么都没出现”
+        self._preset_dialog = dialog
+        dialog.set_default_size(460, 300)
+
+        name_row = Adw.EntryRow(title="名称，例如“粘贴并回车”")
+        token_row = Adw.EntryRow(title="写法，例如 C-S-V / Enter / F13 / []")
+        error_label = Gtk.Label(xalign=0, wrap=True, visible=False)
+        error_label.add_css_class("error")
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        form = Adw.PreferencesGroup()
+        form.add(name_row)
+        form.add(token_row)
+        content.append(form)
+        content.append(error_label)
+        save_btn = Gtk.Button(label="保存")
+        save_btn.add_css_class("suggested-action")
+        save_btn.set_halign(Gtk.Align.END)
+        content.append(save_btn)
+
+        def on_save(*_args):
+            name = name_row.get_text().strip()
+            token = token_row.get_text().strip()
+            problem = self._preset_problem(name, token)
+            if problem:
+                error_label.set_text(problem)
+                error_label.set_visible(True)
+                return
+            USER_PRESETS.append((name, token))
+            try:
+                save_user_presets()
+            except OSError as exc:
+                USER_PRESETS.pop()
+                error_label.set_text(f"写不进 {presets_path()}：{exc}")
+                error_label.set_visible(True)
+                return
+            rebuild_preset_tables()
+            self._refresh_preset_choices()
+            self.preset_row.set_subtitle(
+                f"{len(USER_PRESETS)} 个｜{presets_path().replace(os.path.expanduser('~'), '~')}")
+            self._toast(f"已添加预设：{name}")
+            dialog.close()
+
+        save_btn.connect("clicked", on_save)
+        token_row.connect("entry-activated", on_save)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        toolbar.set_content(content)
+        dialog.set_content(toolbar)
+        dialog.present()
 
     def _on_choice(self, combo, _param, code, kind):
         self._sync_custom_visibility(code, kind)
@@ -1079,6 +1266,8 @@ class SideKeysApp(Adw.Application):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--print", "--mice"):
         return cli_mode(sys.argv[1:])
+    load_user_presets()
+    rebuild_preset_tables()
     app = SideKeysApp()
 
     def activate(application):
