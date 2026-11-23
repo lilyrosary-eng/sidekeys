@@ -295,14 +295,34 @@ shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 
 
+DIAG_LOG_MAX = 64 * 1024  # 诊断日志上限,超过后截断为后半段,避免长期驻留无限增长
+
+
+def _diag_path():
+    return os.path.join(os.path.dirname(config_path()), "diagnostic.log")
+
+
 def _diag(msg):
-    """显式打印诊断信息。pythonw 无 stderr,静默降级但绝不吞掉逻辑错误。"""
+    """诊断信息写文件 + stderr。低频故障无法现场复现,日志是唯一的追查依据。"""
+    line = f"[sidekeys {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
     try:
         if sys.stderr is not None:
-            sys.stderr.write(f"[sidekeys] {msg}\n")
+            sys.stderr.write(line)
             sys.stderr.flush()
     except Exception:
-        pass
+        pass  # pythonw 无控制台,stderr 不可见也不影响文件日志
+    try:
+        path = _diag_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        mode = "w" if size > DIAG_LOG_MAX else "a"  # 超限则截断重来
+        with open(path, mode, encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass  # 日志写失败绝不影响钩子/注入主路径
 
 
 def send_combo(vks):
@@ -515,15 +535,18 @@ class MouseHook:
                                           kernel32.GetModuleHandleW(None), 0)
         if not handle:
             self._error = ctypes.WinError(ctypes.get_last_error())
+            _diag(f"钩子安装失败: {self._error!r}")
             self._ready.set()
             return
         self._tid = kernel32.GetCurrentThreadId()
+        _diag(f"钩子已安装 hwnd_proc tid={self._tid} mapping={list(self.mapping)}")
         self._ready.set()
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         user32.UnhookWindowsHookEx(handle)
+        _diag(f"钩子消息泵退出,已卸载 (tid={self._tid})")
 
     def start(self, timeout=3):
         self._start_fire_worker()
