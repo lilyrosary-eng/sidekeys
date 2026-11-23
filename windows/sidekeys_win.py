@@ -295,6 +295,16 @@ shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 
 
+def _diag(msg):
+    """显式打印诊断信息。pythonw 无 stderr,静默降级但绝不吞掉逻辑错误。"""
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(f"[sidekeys] {msg}\n")
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def send_combo(vks):
     seq = []
     for vk in vks:
@@ -306,6 +316,7 @@ def send_combo(vks):
     arr = (INPUT * len(seq))(*seq)
     sent = user32.SendInput(len(seq), arr, ctypes.sizeof(INPUT))
     if sent != len(seq):
+        _diag(f"SendInput 部分失败: 请求 {len(seq)} 实际 {sent} err={ctypes.get_last_error()}")
         raise ctypes.WinError(ctypes.get_last_error())
 
 
@@ -329,6 +340,41 @@ class MouseHook:
         self._ready = threading.Event()
         self._error = None
         self._proc = None  # 防止回调被 GC
+        # 注入队列:钩子回调只入队,实际 SendInput 交给独立 worker 线程。
+        # 低级鼠标钩子回调里同步调用 SendInput 会在输入拥塞/高权限目标时阻塞,
+        # 一旦回调超时,系统会暂停向所有窗口投递鼠标消息(指针仍动,但点击/悬停失效)。
+        self._fire_queue = queue.Queue()
+        self._fire_thread = None
+        self._fire_stop = threading.Event()
+
+    def _fire_worker(self):
+        while not self._fire_stop.is_set():
+            try:
+                vks = self._fire_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if vks is None:  # 停止哨兵
+                break
+            try:
+                send_combo(vks)
+            except Exception as exc:
+                _diag(f"注入按键失败(已隔离,钩子不受影响): {exc!r}")
+
+    def _start_fire_worker(self):
+        if self._fire_thread is None or not self._fire_thread.is_alive():
+            self._fire_stop.clear()
+            self._fire_thread = threading.Thread(
+                target=self._fire_worker, daemon=True, name="sidekeys-inject")
+            self._fire_thread.start()
+
+    def _stop_fire_worker(self):
+        self._fire_stop.set()
+        if self._fire_thread is not None:
+            self._fire_queue.put(None)
+            self._fire_thread.join(timeout=2)
+            if self._fire_thread.is_alive():
+                _diag("警告:注入线程未在 2s 内退出")
+            self._fire_thread = None
 
     def set_mapping(self, mapping, hold_ms):
         with self._lock:
@@ -347,13 +393,12 @@ class MouseHook:
                 if timer:
                     timer.cancel()
 
-    @staticmethod
-    def _fire(vks):
+    def _fire(self, vks):
+        # 只入队,不直接 SendInput。入队是非阻塞 O(1),保证钩子回调立刻返回。
+        # SendInput 交给 _fire_worker 线程执行,输入拥塞时卡的是那个线程,不会
+        # 拖住钩子回调 —— 低级钩子回调超时会让系统暂停全局鼠标消息投递。
         if vks:
-            try:
-                send_combo(vks)
-            except OSError:
-                pass  # 注入失败(如会话锁定)时 swallow,钩子不能崩
+            self._fire_queue.put(vks)
 
     def _hold_fire(self, key):
         with self._lock:
@@ -443,20 +488,26 @@ class MouseHook:
 
     def _run(self):
         def callback(nCode, wParam, lParam):
-            if nCode == HC_ACTION and wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP):
-                info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                button = (info.mouseData >> 16) & 0xFFFF
-                if button in (1, 2):
-                    gest_ind = self.mapping.get(f"xbutton{button}") or {}
-                    gest_both = self.mapping.get("both") or {}
-                    # 绑了和弦时两个单键都被"占用"(即使单键没绑),否则一起按会先漏出单键原功能
-                    if self._has_gesture(gest_ind) or self._has_gesture(gest_both):
-                        with self._lock:
-                            if wParam == WM_XBUTTONDOWN:
-                                self._phys_down(button, gest_ind, gest_both)
-                            else:
-                                self._phys_up(button, gest_ind, gest_both)
-                        return 1  # down/up 都吞掉,否则目标应用会看到半个点击
+            # 兜底:低级钩子回调抛异常时,ctypes 会返回未定义的 c_longlong。
+            # 若那个值非 0,系统会当成"已处理"而吞掉本次鼠标消息 —— 这正是
+            # 指针能动但点击/悬停失效的典型成因。任何异常一律记录并放行。
+            try:
+                if nCode == HC_ACTION and wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP):
+                    info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                    button = (info.mouseData >> 16) & 0xFFFF
+                    if button in (1, 2):
+                        gest_ind = self.mapping.get(f"xbutton{button}") or {}
+                        gest_both = self.mapping.get("both") or {}
+                        # 绑了和弦时两个单键都被"占用"(即使单键没绑),否则一起按会先漏出单键原功能
+                        if self._has_gesture(gest_ind) or self._has_gesture(gest_both):
+                            with self._lock:
+                                if wParam == WM_XBUTTONDOWN:
+                                    self._phys_down(button, gest_ind, gest_both)
+                                else:
+                                    self._phys_up(button, gest_ind, gest_both)
+                            return 1  # down/up 都吞掉,否则目标应用会看到半个点击
+            except Exception as exc:
+                _diag(f"钩子回调异常(已放行鼠标消息): {exc!r}")
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._proc = HOOKPROC(callback)
@@ -475,6 +526,7 @@ class MouseHook:
         user32.UnhookWindowsHookEx(handle)
 
     def start(self, timeout=3):
+        self._start_fire_worker()
         self._thread = threading.Thread(target=self._run, daemon=True, name="sidekeys-hook")
         self._thread.start()
         if not self._ready.wait(timeout):
@@ -487,6 +539,7 @@ class MouseHook:
             user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
             self._thread.join(timeout=3)
         self._tid = None
+        self._stop_fire_worker()
         with self._lock:
             self._cancel_timers()
             self._states = {}
