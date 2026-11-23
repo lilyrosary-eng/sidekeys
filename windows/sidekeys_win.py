@@ -32,6 +32,12 @@ shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
 WH_MOUSE_LL = 14
 WH_KEYBOARD_LL = 13
+# 紧急退出:Ctrl+Shift+Alt+K(K=Kill)。三修饰键组合极少被占用,且好记。
+# 独立于鼠标钩子跑在单独线程,鼠标输入冻结时仍可用。
+ESC_VKS = (0x11, 0x10, 0x12, 0x4B)  # CTRL, SHIFT, ALT, K
+ESC_HINT = "Ctrl+Shift+Alt+K"
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
 WM_QUIT = 0x0012
 WM_COMMAND = 0x0111
 WM_APP = 0x8000
@@ -286,6 +292,13 @@ user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, c
 user32.DestroyMenu.argtypes = [wintypes.HMENU]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowLongW.restype = ctypes.c_long
+user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF,
+                                              wintypes.BYTE, wintypes.DWORD]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
@@ -571,6 +584,128 @@ class MouseHook:
             self._chord_members = set()
 
 
+class EmergencyExit:
+    """全局紧急退出钩子:Ctrl+Shift+Alt+K 立即杀进程。
+
+    必须在独立线程跑自己的消息泵 —— 如果 MouseHook 的回调卡死导致它的消息泵
+    停转,共用线程的键盘钩子也会失效,逃生键就没意义了。
+    触发用 os._exit:绕开 Python 清理(清理路径可能正卡在坏掉的钩子上),
+    进程一死,所有低级钩子由系统自动卸载,鼠标输入立刻恢复。
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._thread = None
+        self._tid = None
+        self._ready = threading.Event()
+        self._error = None
+        self._down = set()  # 当前按下的 ESC_VKS 子集
+
+    def _run(self):
+        def callback(nCode, wParam, lParam):
+            # 兜底:键盘钩子回调抛异常会导致返回值未定义,可能吞掉普通按键。
+            try:
+                if nCode == HC_ACTION and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk = info.vkCode
+                    if vk in ESC_VKS:
+                        self._down.add(vk)
+                    else:
+                        self._down.clear()  # 中间按了别的键,组合失效
+                    if all(v in self._down for v in ESC_VKS):
+                        _diag(f"紧急退出触发 {ESC_HINT},强制结束进程")
+                        os._exit(2)
+                elif nCode == HC_ACTION and wParam in (0x0101, 0x0105):  # KEYUP/SYSKEYUP
+                    info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    self._down.discard(info.vkCode)
+            except Exception as exc:
+                _diag(f"紧急退出钩子异常(已放行按键): {exc!r}")
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._proc = HOOKPROC(callback)
+        handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc,
+                                          kernel32.GetModuleHandleW(None), 0)
+        if not handle:
+            self._error = ctypes.WinError(ctypes.get_last_error())
+            _diag(f"紧急退出钩子安装失败: {self._error!r}")
+            self._ready.set()
+            return
+        self._tid = kernel32.GetCurrentThreadId()
+        _diag(f"紧急退出钩子已就绪 {ESC_HINT} tid={self._tid}")
+        self._ready.set()
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        user32.UnhookWindowsHookEx(handle)
+
+    def start(self, timeout=3):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="sidekeys-escape")
+        self._thread.start()
+        if not self._ready.wait(timeout):
+            raise TimeoutError("紧急退出钩子没有按时就绪")
+        if self._error:
+            raise self._error
+
+    def stop(self):
+        if self._tid:
+            user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+            self._thread.join(timeout=3)
+
+
+BANNER_MS = 5000  # 启动提示浮窗显示时长
+
+
+class StartupBanner:
+    """启动提示浮窗:告诉用户紧急退出快捷键。鼠标穿透 + 不抢焦点 + 置顶,
+    5 秒后自动销毁,不干扰正常操作。每次启动(含 --tray)都显示。"""
+
+    def __init__(self, root, tip, seconds=BANNER_MS / 1000):
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)          # 无边框
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#1e1e1e")
+        frame = ttk.Frame(self.win, padding=(16, 10))
+        frame.pack()
+        ttk.Label(frame, text="sidekeys 已启动", foreground="#d4d4d4",
+                  background="#1e1e1e", font=("Segoe UI", 10)).pack(anchor="w")
+        ttk.Label(frame, text=f"紧急退出:{ESC_HINT}", foreground="#4ec9b0",
+                  background="#1e1e1e", font=("Consolas", 11, "bold")).pack(anchor="w", pady=(4, 0))
+        ttk.Label(frame, text="鼠标卡死时按此键强制关闭", foreground="#9cdcfe",
+                  background="#1e1e1e", font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+        self.win.update_idletasks()
+        w = self.win.winfo_width()
+        h = self.win.winfo_height()
+        # 右上角,避开任务栏/常见窗口区;留出 12px 边距
+        x = root.winfo_screenwidth() - w - 12
+        y = 12
+        self.win.geometry(f"+{x}+{y}")
+
+        # 鼠标穿透 + 不激活 + 半透明。Tk 不提供这些标志,直接改 Win32 扩展样式。
+        try:
+            hwnd = wintypes.HWND(int(self.win.frame(), 16))  # Tk frame() 返回 0x 前缀 HWND
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x80000
+            WS_EX_TRANSPARENT = 0x20
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x80
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                  style | WS_EX_LAYERED | WS_EX_TRANSPARENT |
+                                  WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+            user32.SetLayeredWindowAttributes(hwnd, 0, 210, 0x02)  # LWA_ALPHA
+        except Exception as exc:
+            _diag(f"浮窗穿透样式设置失败(不影响功能): {exc!r}")
+
+        self.win.after(int(seconds * 1000), self.close)
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class TrayIcon:
     """通知栏图标 + 右键菜单。隐藏窗口跑消息泵;菜单命令放进队列,由 Tk 主线程取走
     (Tkinter 不是线程安全的,不能在托盘线程里直接动界面)。"""
@@ -781,7 +916,14 @@ class App:
         self.root = root
         self.hook = None
         self.tray = None
+        self.escape = None
         self.tray_commands = queue.Queue()
+        # 逃生钩子最先起:独立线程,鼠标钩子卡死时它仍可用
+        try:
+            self.escape = EmergencyExit()
+            self.escape.start()
+        except Exception as exc:
+            _diag(f"警告:紧急退出钩子启动失败: {exc!r}")
         load_user_presets()
         if start_hidden:
             root.withdraw()  # 开机自启:只进托盘,不弹窗口
@@ -847,6 +989,12 @@ class App:
 
         if os.path.exists(config_path()):
             self.apply()  # 有保存的配置就直接生效,开机启动时不需要手点
+
+        # 每次启动都弹一次提示(含 --tray 自启),让人记得逃生键;5s 自动消失
+        try:
+            self.banner = StartupBanner(root, ESC_HINT)
+        except Exception as exc:
+            _diag(f"启动提示浮窗失败(不影响功能): {exc!r}")
 
     def _preset_picked(self, combo, entry):
         token = token_by_label()[combo.get()]
@@ -1001,6 +1149,8 @@ class App:
         self.stop()
         if self.tray:
             self.tray.remove()
+        if self.escape:
+            self.escape.stop()
         self.root.destroy()
 
 
